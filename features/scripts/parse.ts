@@ -11,7 +11,6 @@ import type {
   ScriptParseResult,
   ParsedRole,
   ParsedScene,
-  ParsedBookmark,
   ParseProgress,
   ParseChunk,
   ChunkResult,
@@ -31,6 +30,9 @@ import {
   HEARTBEAT_MS,
   MAX_CHUNK_ATTEMPTS,
   MAX_PARSE_INVOCATIONS,
+  RASTER_CHUNK_MAX_PAGES,
+  RASTER_CHUNK_MAX_BYTES,
+  RASTER_DETECT_SAMPLE_PAGES,
 } from "./constants";
 import {
   normalizeText,
@@ -52,8 +54,10 @@ import {
   isMixedBook,
   dominantKind,
   proposeSplitRanges,
+  pagesInRange,
 } from "./parse-utils";
 import { loadPdf, extractPages, extractPageRange } from "./pdf-split";
+import { openWithPdfium, renderPagesBounded, type RasterDoc } from "./pdf-raster";
 
 // Text-layer threshold: a PDF with (almost) no embedded text is a scan.
 const SCANNED_TEXT_THRESHOLD = 200;
@@ -273,12 +277,30 @@ type PdfSource =
   | { type: "url"; url: string }
   | { type: "base64"; media_type: "application/pdf"; data: string };
 
-/** One scan chunk: the PDF (or sub-PDF) itself → vision analysis. */
+/**
+ * How a scan chunk reaches the model: the PDF (or a pdf-lib sub-PDF) as one
+ * document block, or — when pdf-lib can't open the file — pdfium-rendered
+ * page images, one image block per page in order.
+ */
+type ScanInput =
+  | { kind: "pdf"; source: PdfSource }
+  | { kind: "images"; pngs: Buffer[] };
+
+function scanContentBlocks(input: ScanInput): Anthropic.ContentBlockParam[] {
+  if (input.kind === "pdf") return [{ type: "document", source: input.source }];
+  return input.pngs.map((png) => ({
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: png.toString("base64") },
+  }));
+}
+
+/** One scan chunk: the PDF (or sub-PDF, or page images) → vision analysis. */
 async function runScanChunk(
   client: Anthropic,
-  input: { source: PdfSource; range: PageRange; pageCount: number; preface: string },
+  input: { input: ScanInput; range: PageRange; pageCount: number; preface: string },
 ): Promise<{ result: ChunkResult; usage: { input: number; output: number } }> {
   const chunkPages = input.range.endPage - input.range.startPage + 1;
+  const asImages = input.input.kind === "images";
   const stream = client.messages.stream(
     {
       model: SCRIPT_PARSE_MODEL,
@@ -289,10 +311,12 @@ async function runScanChunk(
         {
           role: "user",
           content: [
-            { type: "document", source: input.source },
+            ...scanContentBlocks(input.input),
             {
               type: "text",
-              text: `${input.preface}Analyse this scanned script (${chunkPages} pages).`,
+              text: asImages
+                ? `${input.preface}Analyse this scanned script (${chunkPages} pages, given as ${chunkPages} page images in order — image 1 is page 1).`
+                : `${input.preface}Analyse this scanned script (${chunkPages} pages).`,
             },
           ],
         },
@@ -404,13 +428,14 @@ const SAMPLE_KIND_MAP: Record<string, DetectSectionKind> = {
  */
 async function detectScanSections(
   client: Anthropic,
-  pdf: PDFDocument,
   pageCount: number,
+  makeContent: (pages: number[]) => Promise<Anthropic.ContentBlockParam[]>,
+  samplePages: number,
 ): Promise<DetectOutcome> {
-  const k = Math.max(1, Math.ceil(pageCount / SCAN_DETECT_SAMPLE_PAGES));
+  const k = Math.max(1, Math.ceil(pageCount / samplePages));
   const sampled: number[] = [];
   for (let p = 1; p <= pageCount; p += k) sampled.push(p);
-  const sampleBytes = await extractPages(pdf, sampled);
+  const sampleBlocks = await makeContent(sampled);
 
   let inputTokens = 0;
   let outputTokens = 0;
@@ -424,11 +449,11 @@ async function detectScanSections(
         {
           role: "user",
           content: [
-            { type: "document", source: toBase64Source(sampleBytes) },
+            ...sampleBlocks,
             {
               type: "text",
               text:
-                `These ${sampled.length} pages are sampled (every ${k}th page) from a ${pageCount}-page book. ` +
+                `These ${sampled.length} pages are sampled (every ${k}th page) from a ${pageCount}-page book, given in order. ` +
                 `For EACH page of this excerpt, numbered 1..${sampled.length} in order, say what it is: ` +
                 `"dialogue" (libretto page with character cues and spoken lines), "music" (engraved music notation, with or without lyrics), "front_matter" (title, cast, musical numbers, synopsis, contents), or "other". ` +
                 `Respond as {"pages":[{"i":int,"kind":string}]} with exactly ${sampled.length} entries.`,
@@ -473,7 +498,7 @@ async function detectScanSections(
     if (windowEnd <= windowStart) continue;
     refined++;
     try {
-      const windowBytes = await extractPageRange(pdf, { startPage: windowStart, endPage: windowEnd });
+      const windowBlocks = await makeContent(pagesInRange({ startPage: windowStart, endPage: windowEnd }));
       const want = cur.kind === "vocal_score" ? "engraved music (the vocal score)" : "dialogue (the libretto)";
       const s2 = client.messages.stream(
         {
@@ -485,11 +510,11 @@ async function detectScanSections(
             {
               role: "user",
               content: [
-                { type: "document", source: toBase64Source(windowBytes) },
+                ...windowBlocks,
                 {
                   type: "text",
                   text:
-                    `This ${windowEnd - windowStart + 1}-page excerpt spans the point where the book changes from ${prev.kind === "vocal_score" ? "engraved music" : "dialogue"} to ${want}. ` +
+                    `This ${windowEnd - windowStart + 1}-page excerpt (pages in order) spans the point where the book changes from ${prev.kind === "vocal_score" ? "engraved music" : "dialogue"} to ${want}. ` +
                     `Which excerpt page (1 = first page of this excerpt) is the FIRST page of ${want}? Respond as {"firstPage":int}.`,
                 },
               ],
@@ -558,6 +583,8 @@ export async function runScriptParse(
   const startedAt = Date.now();
   const heartbeat = startHeartbeat(parseId, leaseToken);
   let progress = (parse.progress as ParseProgress | null) ?? null;
+  // pdfium document for the raster fallback; destroyed in `finally`.
+  let raster: RasterDoc | null = null;
 
   const setDocumentStatus = async (status: string) => {
     if (!parse.documentId) return;
@@ -731,17 +758,39 @@ export async function runScriptParse(
     if (!(await persistProgress(parseId, leaseToken, progress))) return;
 
     // Scan chunks and detection samples need the PDF opened once (lazily).
+    // pdf-lib is the primary engine (it can cut real sub-PDFs); when it can't
+    // parse a file — common with scanner output — pdfium renders pages to
+    // images instead. Both are opened at most once per invocation.
     let pdfDoc: PDFDocument | null | undefined;
+    let pdfLibError: string | null = progress?.pdfLibError ?? null;
     const openPdf = async (): Promise<PDFDocument | null> => {
       if (pdfDoc !== undefined) return pdfDoc;
       try {
         pdfDoc = await loadPdf(bytes);
       } catch (err) {
+        pdfLibError = err instanceof Error ? err.message : String(err);
         console.error("pdf-lib could not open the script:", err);
         pdfDoc = null;
       }
       return pdfDoc;
     };
+    let rasterTried = false;
+    const openRaster = async (): Promise<RasterDoc | null> => {
+      if (raster || rasterTried) return raster;
+      rasterTried = true;
+      try {
+        raster = await openWithPdfium(bytes);
+      } catch (err) {
+        console.error("pdfium could not open the script:", err);
+        raster = null;
+      }
+      return raster;
+    };
+    const rasterBlocks = async (doc: RasterDoc, pages: number[]) =>
+      scanContentBlocks({
+        kind: "images",
+        pngs: (await renderPagesBounded(doc, pages, RASTER_CHUNK_MAX_BYTES)).map((r) => r.png),
+      });
 
     // ── Detect phase ──
     if (progress.phase === "detect") {
@@ -751,7 +800,27 @@ export async function runScriptParse(
           outcome = await detectTextSections(client, pages);
         } else {
           const pdf = await openPdf();
-          if (pdf) outcome = await detectScanSections(client, pdf, pageCount);
+          if (pdf) {
+            outcome = await detectScanSections(
+              client,
+              pageCount,
+              async (pages) => [
+                { type: "document", source: toBase64Source(await extractPages(pdf, pages)) },
+              ],
+              SCAN_DETECT_SAMPLE_PAGES,
+            );
+          } else {
+            const doc = await openRaster();
+            if (doc) {
+              outcome = await detectScanSections(
+                client,
+                pageCount,
+                (pages) => rasterBlocks(doc, pages),
+                RASTER_DETECT_SAMPLE_PAGES,
+              );
+            }
+          }
+          if (pdfLibError) progress.pdfLibError = pdfLibError;
         }
         const proposal = isMixedBook(outcome.sections)
           ? proposeSplitRanges(outcome.sections)
@@ -848,22 +917,54 @@ export async function runScriptParse(
     }
     const kindPreface = progress.kindHint === "vocal_score" ? SCORE_PREFACE : "";
 
-    // Scans: a single chunk can go straight from the signed URL (no pdf-lib);
-    // multiple chunks need sub-PDFs. If pdf-lib can't open a long scan, fall
-    // back to the single call only while that is still within reason.
+    // Scans: pick the engine once (recorded in progress so resumed invocations
+    // reuse it). A single chunk goes straight from the signed URL. Multiple
+    // chunks need pdf-lib sub-PDFs; when pdf-lib can't open the file, a short
+    // scan still fits the single call, and a long one falls back to pdfium
+    // page images (smaller chunks, re-planned before any chunk has run).
     let scanPdf: PDFDocument | null = null;
-    if (progress.mode === "scan" && progress.chunks.length > 1) {
-      scanPdf = await openPdf();
-      if (!scanPdf) {
-        if (pageCount <= SCAN_URL_FALLBACK_MAX_PAGES) {
-          progress.chunks = [
-            { index: 0, startPage: 1, endPage: pageCount, status: "pending", attempts: 0 },
-          ];
-          if (!(await persistProgress(parseId, leaseToken, progress))) return;
+    if (progress.mode === "scan") {
+      const singleChunk = () => {
+        progress!.chunks = [
+          { index: 0, startPage: 1, endPage: pageCount, status: "pending", attempts: 0 },
+        ];
+      };
+      if (!progress.engine) {
+        if (progress.chunks.length === 1) {
+          progress.engine = "url";
         } else {
+          scanPdf = await openPdf();
+          if (scanPdf) {
+            progress.engine = "pdf-lib";
+          } else if (pageCount <= SCAN_URL_FALLBACK_MAX_PAGES) {
+            progress.engine = "url";
+            singleChunk();
+          } else {
+            const doc = await openRaster();
+            if (!doc) {
+              throw new Error(
+                `This scanned file couldn't be opened for page-by-page analysis (${pdfLibError ?? "unknown PDF error"}). Try re-saving it as a standard PDF, or split it into separate files.`,
+              );
+            }
+            progress.engine = "pdfium-raster";
+            progress.chunks = planScanChunks(pageCount, 0, {
+              maxPages: RASTER_CHUNK_MAX_PAGES,
+              maxBytes: RASTER_CHUNK_MAX_BYTES,
+            }).map<ParseChunk>((r, index) => ({ ...r, index, status: "pending", attempts: 0 }));
+          }
+        }
+        if (pdfLibError) progress.pdfLibError = pdfLibError;
+        if (!(await persistProgress(parseId, leaseToken, progress))) return;
+      } else if (progress.engine === "pdf-lib" && progress.chunks.length > 1) {
+        scanPdf = await openPdf();
+        if (!scanPdf) {
           throw new Error(
-            "This scanned file couldn't be opened for page-by-page analysis. Try re-saving it as a standard PDF, or split it into separate files.",
+            `This scanned file could no longer be opened (${pdfLibError ?? "unknown PDF error"}). Please start a new analysis.`,
           );
+        }
+      } else if (progress.engine === "pdfium-raster") {
+        if (!(await openRaster())) {
+          throw new Error("This scanned file could no longer be rendered. Please start a new analysis.");
         }
       }
     }
@@ -917,11 +1018,16 @@ export async function runScriptParse(
             preface,
           });
         } else {
-          const source: PdfSource =
-            total === 1 || !scanPdf
-              ? { type: "url", url: signed.signedUrl }
-              : toBase64Source(await extractPageRange(scanPdf, chunk));
-          out = await runScanChunk(client, { source, range: chunk, pageCount, preface });
+          let input: ScanInput;
+          if (progress.engine === "pdfium-raster" && raster) {
+            const rendered = await renderPagesBounded(raster, pagesInRange(chunk), RASTER_CHUNK_MAX_BYTES);
+            input = { kind: "images", pngs: rendered.map((r) => r.png) };
+          } else if (progress.engine === "pdf-lib" && scanPdf && total > 1) {
+            input = { kind: "pdf", source: toBase64Source(await extractPageRange(scanPdf, chunk)) };
+          } else {
+            input = { kind: "pdf", source: { type: "url", url: signed.signedUrl } };
+          }
+          out = await runScanChunk(client, { input, range: chunk, pageCount, preface });
         }
         chunk.status = "done";
         chunk.result = out.result;
@@ -1000,6 +1106,8 @@ export async function runScriptParse(
     await setDocumentStatus("failed");
   } finally {
     heartbeat.stop();
+    // Assigned inside a closure, so narrow explicitly for the type checker.
+    (raster as RasterDoc | null)?.destroy();
   }
 }
 

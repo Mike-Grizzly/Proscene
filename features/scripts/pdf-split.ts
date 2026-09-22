@@ -2,6 +2,7 @@ import "server-only";
 import type { PDFDocument } from "pdf-lib";
 import type { PageRange } from "./constants";
 import { pagesInRange } from "./parse-utils";
+import type { RasterPage } from "./pdf-raster";
 
 /**
  * pdf-lib wrapper for cutting page ranges out of an uploaded script: used to
@@ -31,4 +32,20 @@ export async function extractPages(
 
 export async function extractPageRange(src: PDFDocument, range: PageRange): Promise<Uint8Array> {
   return extractPages(src, pagesInRange(range));
+}
+
+/**
+ * Assemble rendered pages into an image-only PDF (one PNG per page, sized to
+ * the original page's points). The raster fallback for splitting a book that
+ * pdf-lib can't parse: nothing to copy, so we rebuild from what pdfium drew.
+ */
+export async function buildImagePdf(pages: RasterPage[]): Promise<Uint8Array> {
+  const { PDFDocument: PDFDocumentImpl } = await import("pdf-lib");
+  const out = await PDFDocumentImpl.create();
+  for (const p of pages) {
+    const img = await out.embedPng(p.png);
+    const page = out.addPage([p.pointsWidth, p.pointsHeight]);
+    page.drawImage(img, { x: 0, y: 0, width: p.pointsWidth, height: p.pointsHeight });
+  }
+  return out.save({ useObjectStreams: true });
 }

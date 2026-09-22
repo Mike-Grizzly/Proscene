@@ -316,6 +316,35 @@ characters (later songs/scenes just went missing). Both are gone.
 `script_split_and_chunked_parse` applied live via Supabase MCP (2026-09-22).
 Pure helpers have 26 vitest cases (`parse-utils.test.ts`).
 
+### Engines and fallbacks (2026-09-22, same day — first live run failed)
+
+The owner's first live run (`Beautiful_Script.pdf`, 282-page scan, 11.5 MB,
+via the wizard) reached the new pipeline and then died at "This scanned file
+couldn't be opened for page-by-page analysis": **pdf-lib rejected the file**.
+pdf-lib is unmaintained and chokes on a fair amount of real scanner output, so
+the scan path no longer depends on it:
+
+| Engine (`progress.engine`) | When | What goes to the model |
+|---|---|---|
+| `url` | one chunk (short scan), or pdf-lib fails on a ≤ 100-page scan | the whole PDF via the signed URL (as before) |
+| `pdf-lib` | pdf-lib opens the file | base64 sub-PDFs per chunk (≤ 60 pages / 18 MB) |
+| `pdfium-raster` | pdf-lib fails on a longer scan | **pdfium** (Chrome's engine, already a dependency for the browser OCR rebuild, run server-side from its Node build) renders each page to a grayscale PNG (own zlib-only encoder, `features/scripts/png-encode.ts`); chunks are re-planned at ≤ 24 pages / 20 MB (`RASTER_CHUNK_MAX_*`) and sent as one image block per page, in order; scale drops 1.4 → 1.0 → 0.8 if a batch is heavy |
+
+- Detection uses the same abstraction: sampled pages come from pdf-lib
+  sub-PDFs or pdfium images (≤ 30 samples when rasterized).
+- `splitScriptDocument` falls back the same way: pdfium renders every page
+  of each half at 1.6× and pdf-lib **assembles image-only PDFs**
+  (`buildImagePdf`) — `progress.split.rasterized = true`, and the review page
+  says so. Scans have no text layer to lose; the OCR rebuild still applies.
+- pdfium can't *write* PDFs here (this build doesn't export `addFunction`, which
+  `FPDF_SaveAsCopy` needs), hence images rather than real sub-PDFs.
+- `pdfium.wasm` is read from `node_modules` at runtime and shipped by
+  `outputFileTracingIncludes` in `next.config.ts` (run route + the two pages
+  whose server actions split); the package is in `serverExternalPackages` so
+  its emscripten glue isn't bundled.
+- The pdf-lib error text is stored in `progress.pdfLibError` and included in
+  the final failure message, so the next report is diagnosable from the DB.
+
 ### Limitations (v1)
 - One contiguous range per half: a book that alternates libretto / score per
   act can't be split cleanly — the proposal covers the largest run of each; the
@@ -327,9 +356,9 @@ Pure helpers have 26 vitest cases (`parse-utils.test.ts`).
   ~$1. A cheaper detect model is a one-line constant if wanted.
 - A 60 MB scan means pdf-lib + unpdf both hold the file in memory — if the run
   route OOMs, add a `functions` memory override in `vercel.json`.
-- pdf-lib can't open some malformed/encrypted files: analysis falls back to the
-  single signed-URL call for scans ≤ 100 pages (else fails with a clear message);
-  a split just reports "couldn't split this file".
+- pdf-lib can't open some scanner output: analysis and splitting fall back to
+  pdfium page images (see "Engines and fallbacks") — slower (more, smaller
+  chunks) and the split halves are image-only PDFs.
 - Designer seats (1 analysis per project) can split but then can't analyse the
   score half — the UI note says so.
 

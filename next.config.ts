@@ -27,12 +27,25 @@ const securityHeaders = [
   },
 ];
 
+// pdfium.wasm is read from node_modules at runtime by the AI-parse raster
+// fallback (features/scripts/pdf-raster.ts): the run route and the two pages
+// whose server actions split a book. Tracing it explicitly is what ships it
+// with those functions on Vercel.
+const PDFIUM_WASM = ["./node_modules/@hyzyla/pdfium/dist/pdfium.wasm"];
+
 const nextConfig: NextConfig = {
   experimental: {
     serverActions: {
       bodySizeLimit: "64mb",
     },
     proxyClientMaxBodySize: "64mb",
+  },
+  // Load pdfium's Node build as-is (emscripten glue doesn't survive bundling).
+  serverExternalPackages: ["@hyzyla/pdfium"],
+  outputFileTracingIncludes: {
+    "/api/scripts/[parseId]/run": PDFIUM_WASM,
+    "/productions/[slug]/script/ai": PDFIUM_WASM,
+    "/focus/[slug]": PDFIUM_WASM,
   },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];

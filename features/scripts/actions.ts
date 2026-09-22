@@ -38,8 +38,9 @@ import {
   type ParseProgress,
   type SplitRanges,
 } from "./constants";
-import { hasPendingChunks, validateSplitRanges } from "./parse-utils";
-import { loadPdf, extractPageRange } from "./pdf-split";
+import { hasPendingChunks, validateSplitRanges, pagesInRange } from "./parse-utils";
+import { loadPdf, extractPageRange, buildImagePdf } from "./pdf-split";
+import { openWithPdfium } from "./pdf-raster";
 
 type CurrentUser = Awaited<ReturnType<typeof requireCurrentUser>>;
 
@@ -1146,6 +1147,8 @@ export type SplitScriptResult = {
   parseId?: string;
   /** Why no analysis was staged (quota), when `parseId` is absent. */
   note?: string;
+  /** The halves were rebuilt from page images (original unparseable by pdf-lib). */
+  rasterized?: boolean;
 };
 
 /**
@@ -1226,16 +1229,41 @@ export async function splitScriptDocument(
   if (dlError || !blob) return { error: "Could not read the original script file." };
   let librettoBytes: Uint8Array;
   let scoreBytes: Uint8Array;
+  let rasterized = false;
+  const original = new Uint8Array(await blob.arrayBuffer());
+  const maxPage = Math.max(ranges.libretto.endPage, ranges.vocalScore.endPage);
   try {
-    const pdf = await loadPdf(new Uint8Array(await blob.arrayBuffer()));
-    if (pdf.getPageCount() < Math.max(ranges.libretto.endPage, ranges.vocalScore.endPage)) {
+    const pdf = await loadPdf(original);
+    if (pdf.getPageCount() < maxPage) {
       return { error: "The page ranges exceed the file's page count." };
     }
     librettoBytes = await extractPageRange(pdf, ranges.libretto);
     scoreBytes = await extractPageRange(pdf, ranges.vocalScore);
   } catch (err) {
-    console.error("splitScriptDocument: pdf-lib failed:", err);
-    return { error: "This PDF couldn't be split. Try re-saving it as a standard PDF and analysing again." };
+    // pdf-lib rejects some scanner output. Fall back to pdfium: render every
+    // page of each half and rebuild image-only PDFs (scans have no text layer
+    // to lose; the app's OCR rebuild still applies to the halves).
+    console.error("splitScriptDocument: pdf-lib failed, trying pdfium:", err);
+    let doc: Awaited<ReturnType<typeof openWithPdfium>> | null = null;
+    try {
+      doc = await openWithPdfium(original);
+      if (doc.pageCount < maxPage) {
+        return { error: "The page ranges exceed the file's page count." };
+      }
+      const render = async (pages: number[]) => {
+        const out = [];
+        for (const page of pages) out.push(await doc!.renderPage(page, { scale: 1.6, gray: true }));
+        return out;
+      };
+      librettoBytes = await buildImagePdf(await render(pagesInRange(ranges.libretto)));
+      scoreBytes = await buildImagePdf(await render(pagesInRange(ranges.vocalScore)));
+      rasterized = true;
+    } catch (err2) {
+      console.error("splitScriptDocument: pdfium failed too:", err2);
+      return { error: "This PDF couldn't be split. Try re-saving it as a standard PDF and analysing again." };
+    } finally {
+      doc?.destroy();
+    }
   }
 
   const safeBase =
@@ -1315,7 +1343,7 @@ export async function splitScriptDocument(
         chunks: [],
         invocations: 0,
       }),
-      split: { librettoDocumentId: lib.id, vocalScoreDocumentId: score.id },
+      split: { librettoDocumentId: lib.id, vocalScoreDocumentId: score.id, rasterized },
     };
     await tx
       .update(scriptParses)
@@ -1350,6 +1378,7 @@ export async function splitScriptDocument(
     ...ids,
     parseId: newParseId,
     note: quotaError ?? undefined,
+    rasterized,
   };
 }
 
