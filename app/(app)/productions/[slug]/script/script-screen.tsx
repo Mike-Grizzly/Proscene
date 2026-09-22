@@ -3,7 +3,7 @@
 import { useIsPhone } from "@/lib/use-is-phone";
 import { ScriptViewer } from "./script-viewer";
 import { MobileScriptReader } from "./mobile-script-reader";
-import type { DefaultScript } from "@/features/scripts/queries";
+import type { DefaultScript, ScriptDocumentOption } from "@/features/scripts/queries";
 import type {
   Annotation,
   Bookmark,
@@ -20,6 +20,9 @@ type Props = {
   initialHasStalePages: boolean;
   slug: string;
   canManage: boolean;
+  /** All of the production's scripts, for the switcher (shown when > 1). */
+  scripts?: ScriptDocumentOption[];
+  activeScriptId?: string;
 };
 
 /**
@@ -37,6 +40,8 @@ export function ScriptScreen(props: Props) {
         productionId={props.productionId}
         pdfUrl={props.pdfUrl}
         title={props.script.title}
+        scripts={props.scripts}
+        activeScriptId={props.activeScriptId}
         initialAnnotations={props.initialAnnotations}
         initialBookmarks={props.initialBookmarks}
         initialPageOverrides={props.initialPageOverrides}

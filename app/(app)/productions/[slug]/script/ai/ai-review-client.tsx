@@ -21,14 +21,22 @@ import {
   discardScriptParse,
   fetchLatestScriptParse,
   reparseWithNotes,
+  startScriptParse,
+  type SplitScriptResult,
 } from "@/features/scripts/actions";
 import { ROLE_TYPES } from "@/features/productions/wizard-constants";
-import type {
-  ScriptParseResult,
-  ParsedRole,
-  ParsedScene,
-  ParsedBookmark,
+import {
+  SCRIPT_KIND_LABELS,
+  isScriptKind,
+  type ScriptParseResult,
+  type ParsedRole,
+  type ParsedScene,
+  type ParsedBookmark,
+  type ParseProgress,
 } from "@/features/scripts/constants";
+import { progressSummary } from "@/features/scripts/parse-utils";
+import type { ScriptParseTarget } from "@/features/scripts/queries";
+import { SplitProposal } from "./split-proposal";
 
 type ParseRow = {
   id: string;
@@ -36,9 +44,14 @@ type ParseRow = {
   status: string;
   result: unknown;
   error: string | null;
+  progress?: unknown;
+  pageCount?: number | null;
   inputTokens: number | null;
   outputTokens: number | null;
   documentTitle: string;
+  documentScriptKind?: string | null;
+  /** From the poll: the worker yielded and nothing has re-kicked it. */
+  resumable?: boolean;
 };
 
 type RoleEdit = ParsedRole & { key: string };
@@ -59,6 +72,7 @@ type ParseUsage = {
 // (designer-package users have no dashboard to return to).
 function focusHrefs(slug: string, inFocus: boolean) {
   return {
+    ai: inFocus ? `/focus/${slug}?mode=script&view=ai` : `/productions/${slug}/script/ai`,
     docs: inFocus ? `/focus/${slug}?mode=script` : `/productions/${slug}/documents`,
     script: inFocus ? `/focus/${slug}?mode=script` : `/productions/${slug}/script`,
     blocking: inFocus
@@ -74,6 +88,8 @@ export function AiReviewClient({
   initialParse,
   usage,
   inFocus = false,
+  targets = [],
+  activeDocumentId = null,
 }: {
   slug: string;
   productionId: string;
@@ -81,27 +97,43 @@ export function AiReviewClient({
   usage: ParseUsage;
   /** Rendered inside the Focus View shell: keep all navigation within /focus. */
   inFocus?: boolean;
+  /** Every script document with its latest analysis (a split book has two). */
+  targets?: ScriptParseTarget[];
+  /** Which script document this page is showing the analysis for. */
+  activeDocumentId?: string | null;
 }) {
   const router = useRouter();
-  const { docs: docsHref } = focusHrefs(slug, inFocus);
+  const { docs: docsHref, ai: aiHref } = focusHrefs(slug, inFocus);
   const [parse, setParse] = useState<ParseRow | null>(initialParse);
+  const [splitDone, setSplitDone] = useState<SplitScriptResult | null>(null);
+  const docHref = (documentId: string) => `${aiHref}${aiHref.includes("?") ? "&" : "?"}doc=${documentId}`;
+  const activeTarget = targets.find((t) => t.documentId === (activeDocumentId ?? parse?.documentId)) ?? null;
+  const scriptKind = parse?.documentScriptKind ?? activeTarget?.scriptKind ?? null;
 
-  // Poll while the analysis is still running.
+  // Poll while the analysis is still running. A long book is processed across
+  // several worker invocations; if one yielded and its self-kick was lost, the
+  // poll re-kicks the run route (the row's lease makes a double-kick harmless).
   const pollingRef = useRef(false);
   useEffect(() => {
     if (parse?.status !== "processing") return;
     pollingRef.current = true;
+    const documentId = parse?.documentId ?? activeDocumentId ?? null;
     const tick = async () => {
-      const latest = (await fetchLatestScriptParse(productionId)) as ParseRow | null;
+      const latest = (await fetchLatestScriptParse(productionId, documentId)) as ParseRow | null;
       if (!pollingRef.current) return;
-      if (latest) setParse(latest);
+      if (latest) {
+        setParse(latest);
+        if (latest.resumable && latest.status === "processing") {
+          fetch(`/api/scripts/${latest.id}/run`, { method: "POST" }).catch(() => {});
+        }
+      }
     };
     const interval = setInterval(tick, 3000);
     return () => {
       pollingRef.current = false;
       clearInterval(interval);
     };
-  }, [parse?.status, productionId]);
+  }, [parse?.status, parse?.documentId, productionId, activeDocumentId]);
 
   return (
     <div className="anim-in" style={{ maxWidth: 820, margin: "0 auto", padding: "8px 0 64px" }}>
@@ -147,6 +179,14 @@ export function AiReviewClient({
         Claude reads your script and proposes a cast list, scene breakdown, and
         bookmarks. Review and edit below — nothing is saved to the production
         until you apply it.
+        {scriptKind === "vocal_score" && (
+          <>
+            {" "}
+            For a vocal score it proposes musical-number bookmarks and any
+            singing characters missing from the cast; applying never touches
+            the libretto&apos;s scenes.
+          </>
+        )}
       </p>
       <div
         style={{
@@ -171,8 +211,55 @@ export function AiReviewClient({
         </p>
       </div>
 
-      {!parse && <EmptyState slug={slug} inFocus={inFocus} />}
-      {parse?.status === "processing" && <Processing />}
+      {targets.length > 1 && (
+        <ScriptPicker
+          targets={targets}
+          activeDocumentId={activeDocumentId ?? parse?.documentId ?? null}
+          productionId={productionId}
+          docHref={docHref}
+        />
+      )}
+
+      {splitDone && (
+        <SplitDone result={splitDone} docHref={docHref} slug={slug} inFocus={inFocus} />
+      )}
+
+      {!parse && !splitDone && <EmptyState slug={slug} inFocus={inFocus} />}
+      {parse?.status === "processing" && (
+        <Processing progress={parse.progress as ParseProgress | null | undefined} />
+      )}
+      {parse?.status === "split_suggested" && !splitDone && (
+        <SplitProposal
+          parseId={parse.id}
+          documentTitle={parse.documentTitle}
+          pageCount={
+            parse.pageCount ?? (parse.progress as ParseProgress | null)?.pageCount ?? 0
+          }
+          proposal={(parse.progress as ParseProgress | null)?.detect?.proposal ?? null}
+          sections={(parse.progress as ParseProgress | null)?.detect?.sections ?? []}
+          onSplit={(res) => {
+            if (res.parseId) {
+              fetch(`/api/scripts/${res.parseId}/run`, { method: "POST" }).catch(() => {});
+            }
+            setSplitDone(res);
+            setParse(null);
+            router.refresh();
+          }}
+          onContinue={(id) => {
+            fetch(`/api/scripts/${id}/run`, { method: "POST" }).catch(() => {});
+            setParse((p) => (p ? { ...p, id, status: "processing", error: null } : p));
+          }}
+          onDiscarded={() => router.push(docsHref)}
+        />
+      )}
+      {parse?.status === "split" && !splitDone && (
+        <Card>
+          <p style={{ fontSize: 14, color: "var(--ink-2)", margin: 0 }}>
+            This book was split into a libretto and a vocal score. Pick one above to
+            see its analysis.
+          </p>
+        </Card>
+      )}
       {parse?.status === "failed" && (
         <Failed error={parse.error} slug={slug} inFocus={inFocus} />
       )}
@@ -181,6 +268,7 @@ export function AiReviewClient({
           slug={slug}
           inFocus={inFocus}
           parseId={parse.id}
+          isScore={scriptKind === "vocal_score"}
           onReanalyze={(newId) =>
             setParse((p) =>
               p
@@ -196,6 +284,7 @@ export function AiReviewClient({
           result={parse.result as ScriptParseResult}
           slug={slug}
           inFocus={inFocus}
+          isScore={scriptKind === "vocal_score"}
           onApplied={() => {
             // Designers (in focus) don't manage cast/scenes — once the parse is
             // applied, drop them straight back into the script editor instead of
@@ -302,7 +391,20 @@ function EmptyState({ slug, inFocus }: { slug: string; inFocus: boolean }) {
   );
 }
 
-function Processing() {
+function Processing({ progress }: { progress: ParseProgress | null | undefined }) {
+  const summary = progressSummary(progress);
+  let headline = "Analyzing your script…";
+  let detail =
+    "This usually takes a minute or two for a full script. You can leave this page — we'll send you a notification when it's ready to review.";
+  if (summary?.phase === "detect") {
+    headline = "Checking what's in this file…";
+    detail = `Looking at all ${summary.pageCount} pages to see whether this is a libretto, a vocal score, or both bound together.`;
+  } else if (summary && summary.total > 1) {
+    headline = summary.currentRange
+      ? `Analyzing pages ${summary.currentRange.startPage}–${summary.currentRange.endPage} of ${summary.pageCount}…`
+      : "Finishing up…";
+    detail = `${summary.done} of ${summary.total} parts done. Long books are read in parts and can take several minutes. You can leave this page — we'll notify you when it's ready.`;
+  }
   return (
     <Card>
       <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
@@ -311,16 +413,194 @@ function Processing() {
           style={{ width: 22, height: 22, flexShrink: 0 }}
           aria-hidden
         />
-        <div>
-          <p style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>
-            Analyzing your script…
-          </p>
-          <p style={{ fontSize: 13, color: "var(--ink-3)", margin: "4px 0 0" }}>
-            This usually takes a minute or two for a full script. You can leave
-            this page — we&apos;ll send you a notification when it&apos;s ready
-            to review.
-          </p>
+        <div style={{ flex: 1 }}>
+          <p style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>{headline}</p>
+          <p style={{ fontSize: 13, color: "var(--ink-3)", margin: "4px 0 0" }}>{detail}</p>
+          {summary && summary.total > 1 && (
+            <div
+              aria-hidden
+              style={{
+                height: 4,
+                borderRadius: 999,
+                background: "var(--bg-muted)",
+                marginTop: 10,
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${Math.round((summary.done / summary.total) * 100)}%`,
+                  background: "var(--accent)",
+                  transition: "width .4s",
+                }}
+              />
+            </div>
+          )}
         </div>
+      </div>
+    </Card>
+  );
+}
+
+/** Which script's analysis this page shows, with the status of each. */
+function ScriptPicker({
+  targets,
+  activeDocumentId,
+  productionId,
+  docHref,
+}: {
+  targets: ScriptParseTarget[];
+  activeDocumentId: string | null;
+  productionId: string;
+  docHref: (documentId: string) => string;
+}) {
+  const router = useRouter();
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const anyLive = targets.some((t) => t.latestParse?.status === "processing");
+
+  function analyse(documentId: string) {
+    setError(null);
+    const fd = new FormData();
+    fd.set("document_id", documentId);
+    fd.set("production_id", productionId);
+    startTransition(async () => {
+      const res = await startScriptParse(fd);
+      if (res.error || !res.parseId) {
+        setError(res.error ?? "Could not start analysis.");
+        return;
+      }
+      fetch(`/api/scripts/${res.parseId}/run`, { method: "POST" }).catch(() => {});
+      router.push(docHref(documentId));
+      router.refresh();
+    });
+  }
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {targets.map((t) => {
+          const active = t.documentId === activeDocumentId;
+          const label = isScriptKind(t.scriptKind) ? SCRIPT_KIND_LABELS[t.scriptKind] : t.title;
+          const status = t.latestParse?.status ?? null;
+          const canAnalyse = !status || status === "failed" || status === "split";
+          return (
+            <div
+              key={t.documentId}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "6px 10px 6px 12px",
+                borderRadius: 10,
+                border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                background: active ? "color-mix(in oklch, var(--accent) 8%, var(--bg-elev))" : "var(--bg-elev)",
+              }}
+            >
+              <Link
+                href={docHref(t.documentId)}
+                style={{ fontSize: 13, fontWeight: active ? 600 : 500, color: "var(--ink)", textDecoration: "none" }}
+                title={t.title}
+              >
+                {label}
+              </Link>
+              <span style={{ fontSize: 11, color: "var(--ink-3)" }}>
+                {status === "applied"
+                  ? "applied"
+                  : status === "ready"
+                    ? "ready to review"
+                    : status === "processing"
+                      ? "analysing…"
+                      : status === "split_suggested"
+                        ? "needs a decision"
+                        : status === "failed"
+                          ? "failed"
+                          : "not analysed"}
+              </span>
+              {canAnalyse && (
+                <button
+                  type="button"
+                  onClick={() => analyse(t.documentId)}
+                  disabled={isPending || anyLive}
+                  title={anyLive ? "Wait for the running analysis to finish" : "Analyse this script"}
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    padding: "4px 9px",
+                    border: "1px solid var(--border)",
+                    borderRadius: 7,
+                    background: "transparent",
+                    color: "var(--ink-2)",
+                    cursor: anyLive ? "default" : "pointer",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                  }}
+                >
+                  <Sparkles size={12} /> Analyse
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {error && (
+        <p style={{ color: "var(--c-clay)", fontSize: 13, margin: "8px 0 0" }}>{error}</p>
+      )}
+    </div>
+  );
+}
+
+/** After a split: where the two new scripts went and what happens next. */
+function SplitDone({
+  result,
+  docHref,
+  slug,
+  inFocus,
+}: {
+  result: SplitScriptResult;
+  docHref: (documentId: string) => string;
+  slug: string;
+  inFocus: boolean;
+}) {
+  const { script: scriptHref } = focusHrefs(slug, inFocus);
+  return (
+    <Card>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <span
+          style={{
+            display: "grid",
+            placeItems: "center",
+            width: 32,
+            height: 32,
+            borderRadius: "50%",
+            background: "color-mix(in oklch, var(--accent) 16%, transparent)",
+            color: "var(--accent)",
+          }}
+        >
+          <Check size={18} />
+        </span>
+        <p style={{ fontSize: 16, fontWeight: 600, margin: 0 }}>Split into two scripts</p>
+      </div>
+      <p style={{ fontSize: 13, color: "var(--ink-3)", margin: "0 0 14px", lineHeight: 1.5 }}>
+        The libretto is now the production&apos;s default script and the vocal score
+        sits beside it — everyone can switch between them from the Script tab.
+        {result.parseId
+          ? " The libretto analysis has started; the vocal score can be analysed from the picker above once it finishes."
+          : result.note
+            ? ` No analysis was started: ${result.note}`
+            : ""}
+      </p>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        {result.librettoDocumentId && (
+          <Link href={docHref(result.librettoDocumentId)} style={primaryLink}>
+            {result.parseId ? "Follow the libretto analysis" : "Libretto"}
+          </Link>
+        )}
+        <Link href={scriptHref} style={ghostLink}>
+          Open script
+        </Link>
       </div>
     </Card>
   );
@@ -360,11 +640,13 @@ function Applied({
   slug,
   inFocus,
   parseId,
+  isScore = false,
   onReanalyze,
 }: {
   slug: string;
   inFocus: boolean;
   parseId: string;
+  isScore?: boolean;
   onReanalyze: (newParseId: string) => void;
 }) {
   const {
@@ -394,8 +676,9 @@ function Applied({
           </p>
         </div>
         <p style={{ fontSize: 13, color: "var(--ink-3)", margin: "0 0 16px" }}>
-          The cast list and scene breakdown are now set up, and bookmarks have
-          been added to the script for everyone on the team.
+          {isScore
+            ? "Musical-number bookmarks have been added to the vocal score for everyone on the team, and any characters missing from the cast list were added."
+            : "The cast list and scene breakdown are now set up, and bookmarks have been added to the script for everyone on the team."}
         </p>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <Link href={membersHref} style={primaryLink}>
@@ -489,6 +772,7 @@ function ReviewForm({
   result,
   slug,
   inFocus,
+  isScore = false,
   onApplied,
   onDiscarded,
   onReanalyze,
@@ -497,6 +781,8 @@ function ReviewForm({
   result: ScriptParseResult;
   slug: string;
   inFocus: boolean;
+  /** Vocal score: add-only apply (bookmarks + missing roles; no scenes). */
+  isScore?: boolean;
   onApplied: () => void;
   onDiscarded: () => void;
   onReanalyze: (newParseId: string) => void;
@@ -522,13 +808,15 @@ function ReviewForm({
       roles: roles
         .map(({ name, type }) => ({ name: name.trim(), type }))
         .filter((r) => r.name.length > 0),
-      scenes: scenes
-        .map(({ actNumber, sceneNumber, title }) => ({
-          actNumber,
-          sceneNumber,
-          title: title.trim(),
-        }))
-        .filter((s) => s.title.length > 0),
+      scenes: isScore
+        ? []
+        : scenes
+            .map(({ actNumber, sceneNumber, title }) => ({
+              actNumber,
+              sceneNumber,
+              title: title.trim(),
+            }))
+            .filter((s) => s.title.length > 0),
       bookmarks: bookmarks.map(({ page, title, kind }) => ({
         page,
         title: title.trim(),
@@ -561,7 +849,11 @@ function ReviewForm({
           icon={<Users size={16} />}
           title="Cast & characters"
           count={roles.length}
-          hint="Set each character's prominence. You'll assign actors later."
+          hint={
+            isScore
+              ? "Singing characters found in the score. Only names not already in the cast list will be added."
+              : "Set each character's prominence. You'll assign actors later."
+          }
         />
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
           {roles.map((r, i) => (
@@ -603,7 +895,8 @@ function ReviewForm({
         />
       </Card>
 
-      {/* Scenes */}
+      {/* Scenes (a vocal score never edits the scene list — the libretto owns it) */}
+      {!isScore && (
       <Card>
         <SectionHeader
           icon={<ListTree size={16} />}
@@ -661,6 +954,7 @@ function ReviewForm({
           }
         />
       </Card>
+      )}
 
       {/* Bookmarks */}
       <Card>
@@ -668,7 +962,11 @@ function ReviewForm({
           icon={<BookmarkIcon size={16} />}
           title="Bookmarks"
           count={bookmarks.length}
-          hint="Jump points added to everyone's script reader."
+          hint={
+            isScore
+              ? "One jump point per musical number, added to everyone's copy of the score."
+              : "Jump points added to everyone's script reader."
+          }
         />
         {sceneMarks.length === 0 && songs.length === 0 && (
           <p style={{ fontSize: 13, color: "var(--ink-3)", marginTop: 12 }}>
@@ -702,7 +1000,7 @@ function ReviewForm({
 
       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
         <button onClick={apply} disabled={isPending} style={primaryBtn}>
-          <Check size={15} /> Apply to production
+          <Check size={15} /> {isScore ? "Add to production" : "Apply to production"}
         </button>
         <button
           onClick={() => setConfirmingDiscard(true)}

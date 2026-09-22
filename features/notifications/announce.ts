@@ -106,6 +106,13 @@ export async function sendScriptParseReady(input: {
   productionId: string;
   roleCount: number;
   sceneCount: number;
+  /**
+   * "ready" (default): the breakdown is ready to review. "split_suggested":
+   * the file looks like a libretto + vocal score and needs a boundary decision.
+   */
+  variant?: "ready" | "split_suggested";
+  /** Deep-link the review page to a specific script document. */
+  documentId?: string | null;
 }): Promise<void> {
   try {
     const [prod] = await db
@@ -115,8 +122,14 @@ export async function sendScriptParseReady(input: {
       .limit(1);
     if (!prod) return;
 
-    const link = `/productions/${prod.slug}/script/ai`;
-    const body = `Found ${input.roleCount} characters and ${input.sceneCount} scenes — review and apply.`;
+    const link = input.documentId
+      ? `/productions/${prod.slug}/script/ai?doc=${input.documentId}`
+      : `/productions/${prod.slug}/script/ai`;
+    const split = input.variant === "split_suggested";
+    const title = split ? "Script needs a split decision" : "Script analysis ready";
+    const body = split
+      ? "This file looks like a libretto plus a vocal score — choose how to split it."
+      : `Found ${input.roleCount} characters and ${input.sceneCount} scenes — review and apply.`;
     const prefs = await getPreferencesForUsers([input.userId]);
 
     if (prefs[input.userId]?.inApp ?? true) {
@@ -124,7 +137,7 @@ export async function sendScriptParseReady(input: {
         recipientId: input.userId,
         organizationId: prod.organizationId,
         type: "script_analysis",
-        title: "Script analysis ready",
+        title,
         body,
         link,
       });
@@ -132,7 +145,7 @@ export async function sendScriptParseReady(input: {
 
     if (prefs[input.userId]?.push) {
       await sendPushToUsers([input.userId], {
-        title: "Script analysis ready",
+        title,
         body,
         url: link,
         tag: `script-parse-${input.productionId}`,

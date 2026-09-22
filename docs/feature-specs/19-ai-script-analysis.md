@@ -1,6 +1,6 @@
 # Feature 19 — AI Script Analysis
 
-**Status:** Phase 1 IMPLEMENTED (branch `claude/serene-cray-kmpjry`, not yet merged, not live-verified).
+**Status:** Phase 1 LIVE (merged as PR #30). **Long-book pass — 2026-09-22, branch `claude/loving-babbage-ggkydb`: chunked + resumable parsing (600-page cap), libretto / vocal-score detection + split, per-member script switching, add-only score apply — IMPLEMENTED, not live-verified.** See "Long books" below.
 **Phase 2 (per-role line highlighting):** SCOPED as a beta (2026-06-10) — render-only, client-side, opt-in. Not built yet. See "Phase 2 — per-role line highlighting (Beta)" below.
 
 ## Goal
@@ -140,32 +140,34 @@ in the **applied** state, so a director can keep refining after applying without
 re-uploading. The desktop script reader has a manager-only **"AI setup"** toolbar
 link to this page (`documents:upload` capability).
 
-## Script-recognition cache (global, cross-org)
+## Script-recognition cache (per organization)
 
-A `script_cache` table (server-only, RLS-on/no-policies, **no org column** — it's
-intentionally global) keyed by a **content fingerprint** (SHA-256 of the
-normalized extracted text). Flow:
+A `script_cache` table (server-only, RLS-on/no-policies) keyed by
+**(`organization_id`, content fingerprint)** — SHA-256 of the normalized extracted
+text (raw bytes for scans). It was global/cross-org at first; it became
+**per-org** (decision-log 2026-06-29) because a script can carry prompt-injection
+and a breakdown produced in one org must never be served to another. Flow:
 
 - `runScriptParse` computes the fingerprint after extraction. On a **first** parse
   (not a re-analysis), if a cache entry matches the identical file, it reuses that
   result — status straight to `ready`, **no model call** (instant + free; the
   review page shows "Reused a previously verified breakdown… no AI tokens used").
-- `applyScriptParse` **populates** the cache (upsert by fingerprint) when a parse
-  is applied. For cross-tenant safety it caches the **server-stored model result**
+- `applyScriptParse` **populates** the cache (upsert by org + fingerprint) when a
+  parse is applied. It caches the **server-stored model result**
   (`scriptParses.result`), not the client-supplied apply payload — a user's review
-  edits are trusted for their own production but are never propagated to other orgs
-  via the global cache. So the cache only holds model output for files someone has
-  actually applied.
-- Licensing houses (MTI/Concord/…) ship the **same PDF** to every company, so
-  identical-file matches happen across orgs — a popular show gets parsed once and
-  every later production of it inherits the breakdown.
+  edits are trusted for their own production but never become the cached
+  breakdown. So the cache only holds model output for files someone has actually
+  applied.
+- Licensing houses (MTI/Concord/…) ship the **same PDF** to every company, so a
+  second production of the same show **within the same org** reuses the breakdown
+  instantly. (Cross-org reuse was deliberately given up for the injection reason
+  above.)
 
 **Privacy boundary (enforced by what's stored):** `script_cache.result` holds
 ONLY the structural breakdown `{ title, roles, scenes, bookmarks }`. It never
 contains personal annotations (highlights/notes/cues/ink — those live per-user in
 `script_annotations`), casting (the breakdown has character names + types only,
-no actors), production data, or the script text. That structural breakdown is the
-only thing shared across orgs.
+no actors), production data, or the script text.
 
 ## Scanned scripts (OCR via vision)
 
@@ -183,15 +185,153 @@ of failing, switches to a **vision path**:
   `resolveVisionBookmarks` validates each page is within the document and
   de-dupes. **Bookmarks on scans are best-effort** (model-estimated pages); cast
   and scenes are unaffected.
-- **Page cap:** `MAX_SCANNED_PAGES = 250`. Each scanned page costs image + text
-  tokens, so a very long scan would overflow even the 1M window; beyond the cap
-  the parse fails with a "split it into acts" message.
+- **Long scans are chunked**, not capped at 250 pages any more: see "Long
+  books" below. Each scanned page costs image + text tokens (~1.5–3k), so a
+  scan longer than one chunk (`SCAN_CHUNK_MAX_PAGES = 60` / 18 MB raw) is cut
+  into sub-PDFs with pdf-lib and sent as base64 `document` blocks, one call per
+  chunk. A single-chunk scan still uses the signed-URL path above.
 - **Cache safety:** the global script cache is fingerprinted on the **raw file
   bytes** for scans (the extracted text is empty and would otherwise collide
   across different scans, poisoning the cross-org cache). Text PDFs keep the
   normalized-text fingerprint. Both are SHA-256 hex in the same column.
 - The wizard auto-fill path benefits automatically — it runs the same
   `runScriptParse`.
+
+## Long books — chunked + resumable parsing, libretto / vocal-score split, script switching (2026-09-22, not live-verified)
+
+**Why.** The owner's combined libretto + piano-vocal score PDF was refused
+("too many pages"). Two ceilings were in play: scans were hard-rejected above
+`MAX_SCANNED_PAGES = 250`, and text PDFs were **silently truncated** at 600k
+characters (later songs/scenes just went missing). Both are gone.
+
+### Chunked, resumable runs (`features/scripts/parse.ts`, run route)
+
+- **Chunk plan.** Text PDFs: page ranges whose tagged text stays under
+  `TEXT_CHUNK_CHARS = 450_000` (~110k tokens) — a ≤ ~180-page libretto is still
+  ONE call, exactly as before; only 400–600-page books split. Scans:
+  `min(SCAN_CHUNK_MAX_PAGES = 60, 18 MB raw)` per chunk, cut into sub-PDFs with
+  **pdf-lib** (new dependency, approved 2026-09-22) and sent as base64
+  `document` blocks. Hard cap `MAX_SCRIPT_PAGES = 600`.
+- **Sequential, with carry-forward.** Chunks run one after another (never in
+  parallel): each gets a preface naming the pages it covers, the characters found
+  so far and the last scene begun before it, and is told to report only
+  scene/song starts that BEGIN in its pages and (scans) page numbers *within the
+  excerpt* — offsets are added in code, never by the model. `mergeChunkResults`
+  unions roles by normalized name (keeping the most prominent classification),
+  de-dupes scenes on (act, scene) and bookmarks on (page, title). Text-chunk
+  bookmarks are anchor-resolved against that chunk's pages, so the long-script
+  drift fix still applies.
+- **Lease + heartbeat.** `script_parses` gained `progress` (the plan, per-chunk
+  results, detection output, invocation count), `page_count`, `lease_token`,
+  `lease_expires_at`. `POST /api/scripts/[id]/run` acquires the lease with ONE
+  conditional `UPDATE … RETURNING` (free, expired, or heartbeat quiet > 90 s);
+  losing the race returns `202 { running: true }`. The worker heartbeats
+  `updated_at` every 20 s, writes progress only `WHERE lease_token = mine`, and
+  **yields** when it has used ~90 s of its 300 s budget (persist, release lease,
+  **self-kick** the route with `Authorization: Bearer CRON_SECRET` — the billing
+  cron's convention; origin = `NEXT_PUBLIC_SITE_URL` → `VERCEL_URL`, never the
+  Host header). The review page's 3-s poll re-POSTs `/run` when the row looks
+  `resumable` (lease released and quiet > 30 s, or held with a dead heartbeat),
+  so a lost self-kick is covered while anyone is watching. Per-chunk model calls
+  are bounded (`CHUNK_CALL_TIMEOUT_MS = 190 s`); a failed chunk is retried once
+  from a fresh invocation, then the parse fails naming the pages. Runs are capped
+  at `MAX_PARSE_INVOCATIONS = 15`.
+- **Progress UI.** "Analysing pages 121–240 of 480… (2 of 8 parts done)" with a
+  bar; the detect phase shows "Checking what's in this file…".
+
+### Libretto + vocal-score detection and split
+
+- **When.** First, non-corrective parse of a production document whose
+  `script_kind` is unset; text PDFs ≥ 40 pages (free heuristics; a model call
+  only if the heuristics say "mixed"), scans ≥ 160 pages (vision, sampled).
+- **Text heuristics** (`classifyTextPage` in `parse-utils.ts`): per page —
+  dialogue-cue line ratio (`NAME.` / `NAME:`), music-term hits (allegro, cresc.,
+  rit., segue, vamp, soprano…), syllabified-lyric ratio (`wan - der - ing`),
+  bar-number token ratio, character count. `deriveSections` run-length-encodes
+  the classes and **absorbs islands shorter than 12 pages** into the larger
+  neighbour, so dialogue-cue pages inside a score don't fragment it. If both a
+  libretto run and a score run ≥ 15 pages exist, one cheap model pass (one digest
+  line per page, ~15k tokens for 600 pages) confirms the boundary; its answer is
+  validated (`sanitizeSections`) and falls back to the heuristic sections.
+- **Scans**: a sub-PDF of every k-th page (≤ 60 pages) is classified per page
+  (dialogue / music / front_matter / other); `sectionsFromSamples` expands and
+  smooths single-sample islands; then ≤ 4 refinement calls on the k pages around
+  each libretto↔score boundary pin the exact page.
+- **Proposal** (`proposeSplitRanges`): v1 = ONE contiguous libretto range + ONE
+  contiguous score range (largest run of each, extended over adjacent front
+  matter; contested middle pages go to the earlier half). The parse stops at
+  status **`split_suggested`** (detection output in `progress.detect`, never in
+  `result`), notifies (variant `split_suggested`), and the review page shows the
+  sections found plus two editable ranges (client-validated with
+  `validateSplitRanges`).
+- **"Split & continue"** → `splitScriptDocument(parseId, ranges)`: downloads the
+  original via the admin client, cuts both halves with pdf-lib, uploads them under
+  the production's `documents/{productionId}/…` prefix, and in one transaction
+  inserts two `documents` rows (`documentType "script"`, `script_kind`
+  `libretto` / `vocal_score`, `source_document_id`, `source_page_start/end`,
+  `page_count`, folder inherited), marks the original `script_kind = "combined"`
+  (it stays in Documents), makes the libretto the production default (no version
+  bump / stale flag), sets the parse to status **`split`**. Then it stages the
+  libretto's analysis if the quota allows (the split itself spends none —
+  `countsTowardQuota` excludes `split_suggested` / `split`); the score is analysed
+  from the review page's picker afterwards (one live parse per production).
+  Idempotent: a repeat call returns the documents already created.
+- **"Analyse as one book"** → `continueParseUnsplit`: back to `processing` with
+  `progress.skipDetect`, the client kicks `/run`.
+- **Score parses.** A `vocal_score` document skips detection and gets
+  `SCORE_PREFACE` (roles = singing characters, scenes `[]` unless printed
+  headings, one `song` bookmark per musical number by printed number + title).
+  Its review form hides the scene card; **apply is add-only** (see Reliability).
+
+### Script switching (per member, with a production default)
+
+- New table **`script_preferences`** `(user_id, production_id, active_script_id)`
+  — per member because admins/producers reach productions through
+  `productions:manage` with no membership row (a column on
+  `production_memberships` would have nowhere to store their choice). Uniqueness
+  is app-enforced (like `script_annotations`); `on delete set null` on the
+  document means a deleted script silently falls back.
+- `getActiveScript(productionId, userId)` = the preference if it still points at
+  a live script of this production, else the production default. The Script tab,
+  Focus view and phone reader all use it; the viewer/host is keyed by
+  `script.id` so a switch **remounts** (the viewer seeds its annotation state
+  from props once — without a remount it would save to the wrong `scriptId`).
+- `ScriptSwitcher` (toolbar next to "AI setup", compact in the phone header) →
+  `setMyActiveScript` (choosing the default clears the override so the member
+  follows the default again); managers get "Make default" →
+  `setProductionDefaultScript`. **Neither bumps `scriptVersion` nor flags
+  annotations stale** — that behaviour stays with the Documents-tab "Set as
+  default script" (`setDefaultScript`), which means "a new version replaced the
+  old one". The first Focus upload now uses the non-bumping path too.
+- Documents tab shows a Libretto / Vocal score / Combined book badge
+  (`SCRIPT_KIND_LABELS`); the review page shows a picker with each script's
+  latest-analysis status and an "Analyse" button for un-analysed ones.
+
+### Files
+`features/scripts/{constants,parse-utils,parse-utils.test,pdf-split,parse,actions,queries}.ts`,
+`app/api/scripts/[parseId]/run/route.ts`, `app/(app)/productions/[slug]/script/{page,script-screen,script-viewer,mobile-script-reader,script-switcher}.tsx`,
+`…/script/ai/{page,ai-review-client,split-proposal}.tsx`, `app/focus/[slug]/{page,focus-script-host,focus-script-upload}.tsx`,
+`…/documents/documents-client.tsx`, `features/documents/queries.ts`, `features/notifications/announce.ts`,
+`db/schema/{documents,script-parses,script-preferences,index}.ts`. Migration
+`script_split_and_chunked_parse` applied live via Supabase MCP (2026-09-22).
+Pure helpers have 26 vitest cases (`parse-utils.test.ts`).
+
+### Limitations (v1)
+- One contiguous range per half: a book that alternates libretto / score per
+  act can't be split cleanly — the proposal covers the largest run of each; the
+  rest stays only in the original.
+- Vercel **preview** deployments with Deployment Protection block the server
+  self-kick (it would need `x-vercel-protection-bypass`); the client poll still
+  resumes the parse while the review page is open. Production is unaffected.
+- Detection uses the parse model (`claude-opus-4-8`); a sampled-scan detect is
+  ~$1. A cheaper detect model is a one-line constant if wanted.
+- A 60 MB scan means pdf-lib + unpdf both hold the file in memory — if the run
+  route OOMs, add a `functions` memory override in `vercel.json`.
+- pdf-lib can't open some malformed/encrypted files: analysis falls back to the
+  single signed-URL call for scans ≤ 100 pages (else fails with a clear message);
+  a split just reports "couldn't split this file".
+- Designer seats (1 analysis per project) can split but then can't analyse the
+  score half — the UI note says so.
 
 ## Phase 2 — per-role line highlighting (Beta, SCOPED 2026-06-10, not built)
 
@@ -271,17 +411,21 @@ future lever if AI usage becomes material — deferred until there's token data.
 - **Stalled-parse watchdog.** If the async run worker dies (Vercel reclaim, or
   work > `maxDuration=300s`) the row would sit in `processing` forever — spinning
   the review page and blocking new parses via the concurrency lock. A row
-  `processing` past `STALE_PARSE_MS` (8 min) is now treated as dead: the poll
-  actions (`fetchLatestScriptParse`/`fetchScriptParseById`) flip it to `failed`
-  (`failIfStale`), and all three concurrency locks skip it (`hasLiveProcessing`).
+  `processing` with **no heartbeat for `STALE_PARSE_MS` (8 min)** is treated as
+  dead: the poll actions (`fetchLatestScriptParse`/`fetchScriptParseById`) flip it
+  to `failed` (`failIfStale`), and the concurrency locks skip it
+  (`hasLiveProcessing`). Since the long-book pass, staleness is measured from
+  `updated_at` (the worker heartbeats it every 20 s), not from `created_at`, so a
+  parse that legitimately spans several invocations is never killed.
   Lazy — no cron, since the review page polls every 3s.
 - **Idempotent apply.** `applyScriptParse` re-applying an already-`applied` parse
-  is a no-op (status guard); roles/scenes are inserted additively but
-  **de-duplicated** against the production's existing rows (roles by name, scenes
-  by act/scene number), so a double-click or an overlapping re-parse won't pile up
-  duplicates. It never *deletes* (scenes are shared with the blocking tool, and
-  roles can be hand-added) — a re-parse that drops a role/scene leaves the old row
-  for manual removal.
+  is a no-op (status guard). A libretto/script parse **owns its rows**: it
+  replaces the production's `source = "ai"` roles (re-linking casting by character
+  name) and the `source = "ai"` scenes that have **no beats** (a blocked scene is
+  never deleted), and de-duplicates by name / act-scene against whatever remains
+  (manual rows, blocked scenes, score-added roles). A **vocal-score** parse is
+  add-only: roles it adds carry `source = "ai_score"` so the next libretto apply
+  can't wipe them, and it never touches scenes.
 - **Late-joiner bookmark seeding.** `seedSharedBookmarks` only seeds members
   present at apply time. Members who join later are seeded **lazily on first
   Script-tab open** by `ensureMemberBookmarks` (reads the applied parse's bookmarks
@@ -296,12 +440,13 @@ future lever if AI usage becomes material — deferred until there's token data.
 
 ## Known limitations / risks (see open-questions)
 
-- **No live verification yet** — needs the API key + a real script.
-- **Scanned/image-only PDFs** are now read via Claude's vision/PDF pipeline (see
-  "Scanned scripts" below) — bookmarks on scans are best-effort. Capped at 250
-  pages.
-- **Very long scripts** may exceed `maxDuration=300`; needs Vercel Fluid compute
-  for the higher ceiling.
+- **Long-book pass (chunking, split, switching) is not live-verified** — needs a
+  real 400+-page combined book, text and scanned.
+- **Scanned/image-only PDFs** are read via Claude's vision/PDF pipeline (see
+  "Scanned scripts") — bookmarks on scans are best-effort. Long scans chunk;
+  the hard ceiling is `MAX_SCRIPT_PAGES = 600`.
+- **Very long scripts** are processed across several worker invocations (see
+  "Long books"); a 600-page scan is roughly 1.5–2M input tokens — real money.
 - **Position classification** (lead/supporting) is a model estimate from line
   count/presence — intended to be director-corrected in the review form.
 - **Bookmark seeding** writes one annotations row per member at apply time; fine

@@ -53,7 +53,9 @@ import {
   type Bookmark,
   type PageOverrides,
 } from "@/features/scripts/constants";
-import type { DefaultScript } from "@/features/scripts/queries";
+import type { DefaultScript, ScriptDocumentOption } from "@/features/scripts/queries";
+import { ScriptSwitcher } from "./script-switcher";
+import { SCRIPT_KIND_LABELS, isScriptKind } from "@/features/scripts/constants";
 import { loadPdfDocument } from "@/lib/pdf";
 import { useIsPhone } from "@/lib/use-is-phone";
 import { MobileScriptReader } from "./mobile-script-reader";
@@ -118,6 +120,10 @@ interface Props {
    *  cards with orthogonal leaders. Default false = the normal tool, unchanged.
    *  Only the Focus View passes this. */
   focusMargin?: boolean;
+  /** All of the production's scripts (libretto, vocal score, older uploads);
+   *  the switcher appears in the toolbar when there is more than one. */
+  scripts?: ScriptDocumentOption[];
+  activeScriptId?: string;
 }
 
 type PendingAnnotation =
@@ -135,6 +141,8 @@ export function ScriptViewer({
   slug,
   canManage,
   focusMargin = false,
+  scripts,
+  activeScriptId,
 }: Props) {
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
@@ -1862,6 +1870,14 @@ export function ScriptViewer({
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {scripts && scripts.length > 1 && (
+              <ScriptSwitcher
+                productionId={productionId}
+                scripts={scripts}
+                activeScriptId={activeScriptId ?? script.id}
+                canManage={canManage}
+              />
+            )}
             {canManage && (
               <Link
                 href={`/productions/${slug}/script/ai`}
@@ -2439,7 +2455,9 @@ export function ScriptViewer({
         {/* Script info */}
         {viewMode !== "cuesheet" && (
           <p style={{ fontSize: 11.5, color: "var(--ink-4)", marginTop: 2 }}>
-            {script.title} · v{script.scriptVersion} · Your annotations are private
+            {script.title} · v{script.scriptVersion}
+            {isScriptKind(script.scriptKind) ? ` · ${SCRIPT_KIND_LABELS[script.scriptKind]}` : ""}
+            {" "}· Your annotations are private
           </p>
         )}
       </div>

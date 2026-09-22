@@ -29,7 +29,10 @@ export const scriptParses = pgTable("script_parses", {
   // Temp storage path of the uploaded PDF for a wizard parse (no document row
   // yet). Null once a document_id is set.
   storagePath: text("storage_path"),
-  // processing → ready (awaiting review) → applied; or failed.
+  // processing → ready (awaiting review) → applied; or failed. A combined
+  // libretto + vocal-score book goes processing → split_suggested (awaiting the
+  // user's boundary decision) → split (two documents created) or back to
+  // processing ("analyse as one book").
   status: text("status").notNull().default("processing"),
   // The model's proposal: { title, roles[], scenes[], bookmarks[] }.
   result: jsonb("result"),
@@ -43,6 +46,18 @@ export const scriptParses = pgTable("script_parses", {
   // Anthropic token usage for this parse — for cost visibility and monitoring.
   inputTokens: integer("input_tokens"),
   outputTokens: integer("output_tokens"),
+  // Resumable-run state (ParseProgress in constants.ts): chunk plan, per-chunk
+  // results, detection output, invocation count. Written only by the lease
+  // holder. Null until the first invocation plans the work.
+  progress: jsonb("progress"),
+  // PDF page count, recorded on the first invocation.
+  pageCount: integer("page_count"),
+  // Run lease: exactly one worker invocation may process a parse at a time. A
+  // kick (client poll or server self-kick) acquires the lease with a single
+  // conditional UPDATE; `updated_at` doubles as the heartbeat, so a lease whose
+  // heartbeat has gone quiet is stealable even before it expires.
+  leaseToken: text("lease_token"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   requestedBy: uuid("requested_by").references(() => profiles.id, {
     onDelete: "set null",
   }),
