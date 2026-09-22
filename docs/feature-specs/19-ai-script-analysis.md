@@ -318,11 +318,21 @@ Pure helpers have 26 vitest cases (`parse-utils.test.ts`).
 
 ### Engines and fallbacks (2026-09-22, same day — first live run failed)
 
-The owner's first live run (`Beautiful_Script.pdf`, 282-page scan, 11.5 MB,
-via the wizard) reached the new pipeline and then died at "This scanned file
-couldn't be opened for page-by-page analysis": **pdf-lib rejected the file**.
-pdf-lib is unmaintained and chokes on a fair amount of real scanner output, so
-the scan path no longer depends on it:
+The owner's first live run (`Beautiful_Script.pdf`, 282-page 1-bit CCITT scan,
+11.5 MB, via the wizard) reached the new pipeline and then died at "This
+scanned file couldn't be opened for page-by-page analysis". Reproduced locally
+with the real file: **pdf-lib opens it fine (85 ms)** — the real cause was that
+`unpdf`/pdf.js **transfers the input buffer to its worker and detaches it**, so
+everything that read the same `bytes` afterwards saw an empty file: pdf-lib
+("No PDF header found"), and — since 2026-06-11 — the **scan fingerprint**,
+which was silently `sha256("")` for every scanned script (a per-org cache
+collision waiting to happen; the live cache had no such row). Fix: text
+extraction lives in `features/scripts/pdf-text.ts` and works on a **copy**
+(regression test asserts the caller's buffer is intact). With that, this file
+takes the normal `pdf-lib` engine: five 60-page sub-PDFs of ~1.7 MB each.
+
+Because pdf-lib is unmaintained and does choke on some scanner output, the
+same session also made the scan path independent of it:
 
 | Engine (`progress.engine`) | When | What goes to the model |
 |---|---|---|

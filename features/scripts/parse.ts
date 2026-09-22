@@ -58,6 +58,7 @@ import {
 } from "./parse-utils";
 import { loadPdf, extractPages, extractPageRange } from "./pdf-split";
 import { openWithPdfium, renderPagesBounded, type RasterDoc } from "./pdf-raster";
+import { extractPdfPages } from "./pdf-text";
 
 // Text-layer threshold: a PDF with (almost) no embedded text is a scan.
 const SCANNED_TEXT_THRESHOLD = 200;
@@ -66,19 +67,6 @@ const TEXT_DETECT_MIN_PAGES = 40;
 // Scans this short still take the legacy single signed-URL call when pdf-lib
 // can't open the file (no chunking needed, no pdf-lib needed).
 const SCAN_URL_FALLBACK_MAX_PAGES = 100;
-
-/**
- * Extract the text of each page of a PDF, one string per page (index 0 = page
- * 1). Uses `unpdf`, which ships a serverless-safe pdfjs build — no browser
- * globals (DOMMatrix etc.), so it runs on Vercel's Node runtime.
- */
-async function extractPdfPages(data: Uint8Array): Promise<string[]> {
-  const { getDocumentProxy, extractText } = await import("unpdf");
-  const pdf = await getDocumentProxy(data);
-  const { text } = await extractText(pdf, { mergePages: false });
-  const pages = Array.isArray(text) ? text : [text];
-  return pages.map((t) => (t ?? "").replace(/[ \t]+/g, " ").trim());
-}
 
 const OUTPUT_SHAPE = `{
   "title": string,                       // the show's title, "" if unknown

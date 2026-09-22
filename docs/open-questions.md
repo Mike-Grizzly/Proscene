@@ -55,13 +55,15 @@ Built on `claude/loving-babbage-ggkydb` (spec: `feature-specs/19-ai-script-analy
 - **Alternating-section books** (libretto / score per act) can't be split
   cleanly in v1 — one contiguous range per half; the rest stays in the original.
   Revisit if it shows up in practice (would need multiple ranges per document).
-- **First live run failed on pdf-lib (2026-09-22, same day).** The owner's
-  282-page scan was rejected by pdf-lib; the pdfium raster fallback was added
-  in response but is itself **not live-verified**. Confirm on the same file:
-  `progress.engine = "pdfium-raster"`, ~12 chunks, several invocations, then
-  `ready`. If pdfium also fails, the stored `progress.pdfLibError` says why.
-  Also confirm `pdfium.wasm` actually ships (tracing) — a missing wasm shows
-  up as "pdfium could not open the script" in the function logs.
+- **First live run failed (2026-09-22, same day) — root cause fixed, not yet
+  live-verified.** pdf.js detached the shared buffer, so pdf-lib saw an empty
+  file (and every scan's fingerprint was `sha256("")` since June — the live
+  cache had no such row, but check `script_cache` for fingerprint
+  `e3b0c442…b855` if a scan ever returns a wrong cached breakdown). Confirm on
+  the same file: `progress.engine = "pdf-lib"`, 5 chunks, several invocations,
+  then `ready`. The pdfium raster fallback (`engine = "pdfium-raster"`) is
+  belt-and-braces and also unverified live; a missing `pdfium.wasm` shows up
+  as "pdfium could not open the script" in the function logs.
 - **Memory on huge scans.** pdf-lib, unpdf and (in the fallback) pdfium all
   hold the file; rendering adds ~4 MB per page transiently. If the run route
   OOMs on Vercel, add a `functions` memory override in `vercel.json`.
