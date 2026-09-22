@@ -1,4 +1,13 @@
-import { pgTable, uuid, text, integer, boolean, timestamp, index } from "drizzle-orm/pg-core";
+import {
+  pgTable,
+  uuid,
+  text,
+  integer,
+  boolean,
+  timestamp,
+  index,
+  type AnyPgColumn,
+} from "drizzle-orm/pg-core";
 import { productions } from "./productions";
 import { profiles } from "./users";
 
@@ -38,6 +47,22 @@ export const documents = pgTable("documents", {
   isDefaultScript: boolean("is_default_script").notNull().default(false),
   scriptVersion: integer("script_version").notNull().default(1),
   processingStatus: text("processing_status").notNull().default("none"),
+  // Script-kind provenance for split books. null for an ordinary upload;
+  // "libretto" / "vocal_score" for the halves produced by `splitScriptDocument`;
+  // "combined" on the original once it has been split. Also the AI-parse prompt
+  // hint: a "vocal_score" document skips section detection and uses the score
+  // preface. App-enforced enum (SCRIPT_KINDS in features/scripts/constants.ts).
+  scriptKind: text("script_kind"),
+  // The combined document this one was cut from, plus the 1-based page range
+  // it covers in that source. Null for ordinary uploads.
+  sourceDocumentId: uuid("source_document_id").references(
+    (): AnyPgColumn => documents.id,
+    { onDelete: "set null" },
+  ),
+  sourcePageStart: integer("source_page_start"),
+  sourcePageEnd: integer("source_page_end"),
+  // PDF page count, recorded by the AI parse / split. Null until known.
+  pageCount: integer("page_count"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

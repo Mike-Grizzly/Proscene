@@ -6,7 +6,7 @@ import {
   requestDocumentUpload,
   finalizeDocumentUpload,
 } from "@/features/documents/actions";
-import { setDefaultScript, startScriptParse } from "@/features/scripts/actions";
+import { setProductionDefaultScript, startScriptParse } from "@/features/scripts/actions";
 import { uploadFileToSignedUrl } from "@/lib/storage-upload";
 
 /**
@@ -85,7 +85,9 @@ export function FocusScriptUpload({
       const fd = new FormData();
       fd.set("document_id", fin.documentId);
       fd.set("production_id", productionId);
-      const def = await setDefaultScript(fd);
+      // First script for this production: plain default assignment (no
+      // version bump / stale flag — there is nothing to mark stale).
+      const def = await setProductionDefaultScript(productionId, fin.documentId);
       if (def.error) {
         setError(def.error);
         setStage(null);

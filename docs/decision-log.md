@@ -3009,3 +3009,64 @@ never-themed `--brand-accent`), so there's no accidental recolouring to guard
 against.
 
 **Impact:** None — no code change. Closes M13 in `ux-backlog.md`.
+
+---
+
+## 2026-09-22 — Long-book AI parsing: chunked resumable runs with a DB lease; libretto / vocal-score split; per-member script choice
+
+**Context:** a combined libretto + piano-vocal score PDF was refused by the AI
+parse. Scans were hard-capped at 250 pages, text PDFs silently truncated at 600k
+chars, and the whole book went to Claude in one call inside one 300-s
+invocation. Owner decisions (2026-09-22): raise the ceiling properly, detect and
+physically split such books (pdf-lib approved), per-person script switching
+with a production default, add-only score analysis.
+
+**Decisions:**
+
+1. **Chunk sequentially, never in parallel.** Scene numbering and role
+   prominence are whole-book judgements; each chunk gets carry-forward context
+   (roles so far, last scene begun) and reports only starts within its pages;
+   scan page numbers are excerpt-relative and offset in code. Chunk sizes keep an
+   ordinary ≤ ~180-page libretto a single call (450k chars), so tuned behaviour
+   is unchanged for the common case.
+2. **Resumability = lease + heartbeat on `script_parses`, not a queue.** The run
+   route acquires `lease_token` with one conditional `UPDATE … RETURNING`
+   (free / expired / heartbeat quiet > 90 s); the worker writes only
+   `WHERE lease_token = mine`, heartbeats `updated_at`, yields at ~90 s and
+   self-kicks the route with the existing `CRON_SECRET` bearer convention (origin
+   from `NEXT_PUBLIC_SITE_URL` / `VERCEL_URL`, never the Host header); the review
+   poll re-kicks a `resumable` row. Two kickers are safe because of the lease.
+   Staleness is measured from the last heartbeat. Hard cap 600 pages.
+3. **Detection output lives in `progress.detect`, and status carries the flow**
+   (`processing → split_suggested → split | processing`) — no `kind` column on
+   parses, no overloading of `result` (cast to `ScriptParseResult` in many
+   places). Text detection is free heuristics first, one cheap model pass only
+   when mixed; scans classify a sampled sub-PDF then refine boundaries.
+4. **Split = two real documents**, not page ranges on one document: every
+   downstream surface (viewer, OCR, bookmarks, annotations, AI parse) is already
+   per document, so nothing needs range-awareness. `documents` gained
+   `script_kind`, `source_document_id`, `source_page_start/end`, `page_count`;
+   the original stays as `combined`. v1 proposes one contiguous range per half.
+5. **Score apply is add-only with `source = "ai_score"`.** The libretto apply
+   replaces its own `source = "ai"` rows; tagging score-added roles differently
+   means neither apply can wipe the other's work, without new ownership columns.
+   Score parses never touch scenes.
+6. **Per-member preference in a new `script_preferences` table**, not a column
+   on `production_memberships`: admins/producers and designer-only users reach
+   productions without a membership row. App-enforced uniqueness (repo rule: no
+   composite uniques). Choosing the default clears the override.
+7. **Switching never bumps `scriptVersion` or flags annotations stale.** That
+   behaviour (`setDefaultScript`) means "a new version replaced the old one";
+   sibling scripts keep their own annotations by document id. New
+   `setProductionDefaultScript` / `assignDefaultScript` are the non-bumping path;
+   the first Focus upload uses it too. The viewer is keyed by script id so a
+   switch remounts rather than saving to the wrong document.
+8. **Quota:** `split_suggested` / `split` rows don't count toward the
+   per-production pill (`countsTowardQuota`); the org monthly backstop still
+   counts everything non-failed. Only the libretto parse is auto-staged after a
+   split (one live parse per production); the score is analysed from the picker.
+9. **Model:** detection reuses `SCRIPT_PARSE_MODEL`; no new model decision.
+
+**Impact:** migration `script_split_and_chunked_parse` applied live (Supabase
+MCP); `pdf-lib` added; 26 vitest cases for the pure helpers. Not live-verified
+— see open-questions (2026-09-22).

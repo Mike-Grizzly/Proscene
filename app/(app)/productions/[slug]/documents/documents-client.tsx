@@ -1,5 +1,7 @@
 "use client";
 
+import { SCRIPT_KIND_LABELS, isScriptKind } from "@/features/scripts/constants";
+
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -444,6 +446,23 @@ export function DocumentsClient({
                             }}
                           >
                             Default Script
+                          </span>
+                        )}
+                        {isScriptKind(doc.scriptKind) && (
+                          <span
+                            style={{
+                              flexShrink: 0,
+                              fontSize: 10,
+                              fontWeight: 600,
+                              letterSpacing: ".04em",
+                              textTransform: "uppercase",
+                              padding: "2px 6px",
+                              borderRadius: 999,
+                              background: "var(--bg-muted)",
+                              color: "var(--ink-3)",
+                            }}
+                          >
+                            {SCRIPT_KIND_LABELS[doc.scriptKind]}
                           </span>
                         )}
                       </div>

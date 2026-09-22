@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { FocusShell } from "./focus-shell";
 import { ScriptViewer } from "@/app/(app)/productions/[slug]/script/script-viewer";
-import type { DefaultScript } from "@/features/scripts/queries";
+import type { DefaultScript, ScriptDocumentOption } from "@/features/scripts/queries";
 import type {
   Annotation,
   Bookmark,
@@ -32,6 +32,8 @@ type ScriptProps = {
   initialHasStalePages: boolean;
   slug: string;
   canManage: boolean;
+  scripts?: ScriptDocumentOption[];
+  activeScriptId?: string;
 };
 
 /**

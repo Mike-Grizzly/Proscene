@@ -32,3 +32,4 @@ export * from "./script-annotations";
 export * from "./script-parses";
 export * from "./script-cache";
 export * from "./script-ocr";
+export * from "./script-preferences";

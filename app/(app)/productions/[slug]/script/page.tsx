@@ -3,7 +3,11 @@ import { requireCurrentUser } from "@/lib/auth";
 import { can } from "@/lib/permissions";
 import { getProductionBySlug } from "@/features/productions/queries";
 import { getProductionMembership } from "@/features/members/queries";
-import { getDefaultScript, getScriptAnnotations } from "@/features/scripts/queries";
+import {
+  getActiveScript,
+  getScriptDocuments,
+  getScriptAnnotations,
+} from "@/features/scripts/queries";
 import { getScriptUrl, ensureMemberBookmarks } from "@/features/scripts/actions";
 import type { Annotation, Bookmark, PageOverrides } from "@/features/scripts/constants";
 import { ScriptScreen } from "./script-screen";
@@ -26,7 +30,12 @@ export default async function ScriptPage({
     if (!membership) redirect("/productions");
   }
 
-  const script = await getDefaultScript(production.id);
+  // The member's own choice of script (libretto vs vocal score), else the
+  // production default. The list feeds the viewer's switcher.
+  const [script, scripts] = await Promise.all([
+    getActiveScript(production.id, user.id),
+    getScriptDocuments(production.id),
+  ]);
 
   if (!script) {
     return (
@@ -62,6 +71,9 @@ export default async function ScriptPage({
 
   return (
     <ScriptScreen
+      // Remount on switch: the viewer seeds its annotation state from props
+      // once, so a swap without a remount would save to the wrong script.
+      key={script.id}
       script={script}
       productionId={production.id}
       pdfUrl={pdfUrl}
@@ -71,6 +83,8 @@ export default async function ScriptPage({
       initialHasStalePages={hasStalePages}
       slug={slug}
       canManage={can(user.role, "documents:upload")}
+      scripts={scripts}
+      activeScriptId={script.id}
     />
   );
 }

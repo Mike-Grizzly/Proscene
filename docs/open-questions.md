@@ -29,6 +29,49 @@ Unresolved questions, risks, and concerns. Organized by area. Do not decide answ
 
 ---
 
+## Long-book AI parsing, libretto / vocal-score split, script switching (added 2026-09-22) — NOT live-verified
+
+Built on `claude/loving-babbage-ggkydb` (spec: `feature-specs/19-ai-script-analysis.md` → "Long books"). Needs a real run before it's trusted:
+
+- **Live verification.** (a) A ≤ 180-page text libretto must parse exactly as
+  before (one chunk). (b) A 400+-page text combined book → `split_suggested`
+  with ranges within ±1 page → split → two documents open in the viewer with the
+  right page counts → libretto parse runs → score analysed from the picker →
+  score apply adds `source = "ai_score"` roles and song bookmarks only, no scene
+  changes → re-applying the libretto keeps the score roles. (c) A 400+-page
+  **scanned** combined book: sampled detect → proposal → analysis crosses ≥ 2
+  invocations (`progress.invocations ≥ 2`, `lease_expires_at` null between them,
+  `updated_at` ticking ~20 s), still finishes with the review tab closed
+  (self-kick) and notifies. (d) Kill test: a live lease with a stale heartbeat is
+  stolen by the poll's re-POST; two POSTs within 1 s → one `invocations`
+  increment. (e) Switching persists across reload and agrees in Focus and on the
+  phone; "Make default" changes others' fallback without touching
+  `has_stale_pages`; deleting the preferred document falls back cleanly.
+- **Self-kick on Vercel preview deployments.** Deployment Protection would block
+  the server's own `POST /run` (needs `x-vercel-protection-bypass`); the review
+  page's poll still resumes the parse while it's open. Production is fine.
+  Requires `CRON_SECRET` and `NEXT_PUBLIC_SITE_URL` to be set (both already
+  are); without them the client poll is the only kicker.
+- **Alternating-section books** (libretto / score per act) can't be split
+  cleanly in v1 — one contiguous range per half; the rest stays in the original.
+  Revisit if it shows up in practice (would need multiple ranges per document).
+- **Memory on huge scans.** pdf-lib + unpdf both hold a 60 MB file; if the run
+  route OOMs on Vercel, add a `functions` memory override in `vercel.json`.
+- **Cost.** A 600-page scanned parse is ~1.5–2M input tokens on Opus 4.8; the
+  per-production and org caps are the only brake. A cheaper detect model is a
+  one-line constant (`lib/anthropic.ts`) if wanted.
+- **Documents-tab "Set as default script" still flags every annotation in the
+  production stale** (`setDefaultScript`), including the score's when someone
+  bumps the libretto. Left as-is for v1; the switcher's paths don't do this.
+- **Designer seats** (1 analysis per project) can split a book but then can't
+  analyse the score half. Decide whether a split should grant a second analysis.
+- **Blocked runs never self-heal without a viewer.** If both the self-kick and
+  the poll are absent, a yielded parse idles until the 8-min watchdog fails it
+  on the next poll/start. Acceptable for now (the requester is notified only on
+  completion); a cron sweep of `resumable` rows would close the gap.
+
+---
+
 ## DB-level constraints + committed-migration workflow deferred (added 2026-06-29)
 
 - A security review recommended belt-and-suspenders **database uniqueness

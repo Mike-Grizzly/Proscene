@@ -185,7 +185,120 @@ export type ScriptParseResult = {
   bookmarks: ParsedBookmark[];
 };
 
-export type ScriptParseStatus = "processing" | "ready" | "applied" | "failed";
+// processing → ready → applied | failed. A combined libretto + vocal-score
+// book pauses at split_suggested (awaiting the user's boundary decision) and,
+// once split, ends at "split" — the halves get their own parses.
+export type ScriptParseStatus =
+  | "processing"
+  | "ready"
+  | "applied"
+  | "failed"
+  | "split_suggested"
+  | "split";
+
+/** Parses that spent model budget and should count against the caps. */
+export function countsTowardQuota(status: string): boolean {
+  return status !== "failed" && status !== "split" && status !== "split_suggested";
+}
+
+// ── Script kinds (documents.script_kind) ─────────────────────────────────────
+export const SCRIPT_KINDS = ["libretto", "vocal_score", "combined"] as const;
+export type ScriptKind = (typeof SCRIPT_KINDS)[number];
+export const SCRIPT_KIND_LABELS: Record<ScriptKind, string> = {
+  libretto: "Libretto",
+  vocal_score: "Vocal score",
+  combined: "Combined book",
+};
+export function isScriptKind(value: unknown): value is ScriptKind {
+  return typeof value === "string" && (SCRIPT_KINDS as readonly string[]).includes(value);
+}
+
+// ── Long-book parsing: chunked, resumable analysis ───────────────────────────
+// A 1-based inclusive page range within a PDF.
+export type PageRange = { startPage: number; endPage: number };
+
+/** One chunk's model output, bookmarks already offset to absolute pages. */
+export type ChunkResult = {
+  title: string;
+  roles: ParsedRole[];
+  scenes: ParsedScene[];
+  bookmarks: ParsedBookmark[];
+};
+
+export type ParseChunk = PageRange & {
+  index: number;
+  status: "pending" | "done" | "failed";
+  attempts: number;
+  result?: ChunkResult;
+  inputTokens?: number;
+  outputTokens?: number;
+};
+
+export type DetectSectionKind = "libretto" | "vocal_score" | "front_matter" | "other";
+export type DetectSection = PageRange & { kind: DetectSectionKind; label: string };
+export type SplitRanges = { libretto: PageRange; vocalScore: PageRange };
+
+/**
+ * Resumable-run state stored on `script_parses.progress`. Written only by the
+ * invocation holding the row's lease. `mode` is decided once from the text
+ * layer; `phase` moves detect → analyse; `chunks` is the analysis plan.
+ */
+export type ParseProgress = {
+  version: 1;
+  mode: "text" | "scan";
+  pageCount: number;
+  phase: "detect" | "analyse";
+  chunks: ParseChunk[];
+  invocations: number;
+  // Set by "Analyse as one book" so a resumed run doesn't re-detect.
+  skipDetect?: boolean;
+  // Kind of book being analysed (prompt hint). From documents.script_kind or
+  // from a single-kind detection result.
+  kindHint?: "libretto" | "vocal_score" | null;
+  detect?: {
+    sections: DetectSection[];
+    proposal: SplitRanges | null;
+    inputTokens: number;
+    outputTokens: number;
+  };
+  split?: { librettoDocumentId: string; vocalScoreDocumentId: string };
+};
+
+/** What the review page shows while a parse runs. */
+export type ParseProgressSummary = {
+  phase: "detect" | "analyse";
+  done: number;
+  total: number;
+  currentRange: PageRange | null;
+  pageCount: number;
+};
+
+// Tuning. A text libretto ≤ ~180 pages stays a single call (unchanged
+// behaviour); only 400–600-page books chunk. Scan chunks are bounded by both
+// pages and raw bytes so the base64 sub-PDF stays far below Claude's 32 MB
+// request cap.
+export const MAX_SCRIPT_PAGES = 600;
+export const TEXT_CHUNK_CHARS = 450_000;
+export const SCAN_CHUNK_MAX_PAGES = 60;
+export const SCAN_CHUNK_MAX_BYTES = 18 * 1024 * 1024;
+// Detection: a scanned libretto alone is never this long; a combined book is.
+export const SCAN_DETECT_MIN_PAGES = 160;
+export const SCAN_DETECT_SAMPLE_PAGES = 60;
+// Sections shorter than this are absorbed into a neighbour (cue pages inside
+// a score, a title page inside a libretto) so a book yields two clean halves.
+export const DETECT_MIN_SECTION_PAGES = 12;
+export const DETECT_MIN_KIND_PAGES = 15;
+// Time budget per worker invocation (Vercel maxDuration = 300 s): only START a
+// chunk while under this, and bound each model call so the worst case still
+// finishes inside the invocation.
+export const INVOCATION_START_BUDGET_MS = 90_000;
+export const CHUNK_CALL_TIMEOUT_MS = 190_000;
+// Lease outlives any single invocation; heartbeat proves liveness.
+export const LEASE_MS = 320_000;
+export const HEARTBEAT_MS = 20_000;
+export const DEAD_HEARTBEAT_MS = 90_000;
+export const MAX_CHUNK_ATTEMPTS = 2;
+export const MAX_PARSE_INVOCATIONS = 15;
 
 // ── Scanned-script OCR (in-browser, tesseract.js — see lib/ocr.ts) ──────────
 // A single OCR'd word with a box normalized to 0..1 of the page width/height,

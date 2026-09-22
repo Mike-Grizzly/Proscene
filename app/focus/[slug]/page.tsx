@@ -10,10 +10,12 @@ import {
   getProductionMembers,
 } from "@/features/members/queries";
 import {
-  getDefaultScript,
+  getActiveScript,
+  getScriptDocuments,
   getScriptAnnotations,
   getLatestScriptParse,
   getProductionParseUsage,
+  getScriptParseTargets,
 } from "@/features/scripts/queries";
 import { getScriptUrl, ensureMemberBookmarks } from "@/features/scripts/actions";
 import {
@@ -50,6 +52,9 @@ import { getDesignerSeat } from "@/features/designer/entitlement";
 import type { DesignerTool } from "@/features/designer/constants";
 import { DesignerToolLock } from "@/features/designer/tool-lock";
 
+// Splitting a combined book runs as a server action from the embedded AI view.
+export const maxDuration = 300;
+
 type CurrentUserLike = {
   firstName: string | null;
   lastName: string | null;
@@ -74,13 +79,14 @@ export default async function FocusPage({
   searchParams,
 }: {
   params: Promise<{ slug: string }>;
-  searchParams: Promise<{ mode?: string; beat?: string; view?: string }>;
+  searchParams: Promise<{ mode?: string; beat?: string; view?: string; doc?: string }>;
 }) {
   const { slug } = await params;
   const {
     mode: modeParam,
     beat: requestedBeatId,
     view,
+    doc: requestedDocId,
   } = await searchParams;
   const mode = modeParam === "blocking" ? "blocking" : "script";
 
@@ -262,26 +268,36 @@ export default async function FocusPage({
 
   // AI script setup, embedded in focus so designers never leave for /script/ai.
   if (view === "ai" && can(user.role, "documents:upload")) {
-    const [parse, usage] = await Promise.all([
-      getLatestScriptParse(production.id),
+    const [parse, usage, targets] = await Promise.all([
+      getLatestScriptParse(production.id, requestedDocId || undefined),
       getProductionParseUsage(production.id),
+      getScriptParseTargets(production.id),
     ]);
+    const activeDocumentId = requestedDocId || parse?.documentId || null;
     return (
       <FocusShell {...shellProps} mode="script">
         <div className="fx-ai">
           <AiReviewClient
+            key={activeDocumentId ?? "latest"}
             slug={slug}
             productionId={production.id}
             initialParse={parse}
             usage={usage}
             inFocus
+            targets={targets}
+            activeDocumentId={activeDocumentId}
           />
         </div>
       </FocusShell>
     );
   }
 
-  const script = await getDefaultScript(production.id);
+  // The member's own choice of script (libretto vs vocal score), else the
+  // production default. The list feeds the viewer's switcher.
+  const [script, scripts] = await Promise.all([
+    getActiveScript(production.id, user.id),
+    getScriptDocuments(production.id),
+  ]);
   if (!script) {
     return (
       <FocusShell {...shellProps} mode="script">
@@ -318,6 +334,9 @@ export default async function FocusPage({
 
   return (
     <FocusScriptHost
+      // Remount on switch: the viewer seeds its annotation state from props
+      // once, so a swap without a remount would save to the wrong script.
+      key={script.id}
       shell={shellProps}
       script={{
         script,
@@ -329,6 +348,8 @@ export default async function FocusPage({
         initialHasStalePages: hasStalePages,
         slug,
         canManage: can(user.role, "documents:upload"),
+        scripts,
+        activeScriptId: script.id,
       }}
     />
   );

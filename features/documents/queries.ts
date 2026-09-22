@@ -31,6 +31,8 @@ export async function getDocumentsByProduction(productionId: string) {
       isDefaultScript: documents.isDefaultScript,
       scriptVersion: documents.scriptVersion,
       processingStatus: documents.processingStatus,
+      scriptKind: documents.scriptKind,
+      sourceDocumentId: documents.sourceDocumentId,
       createdAt: documents.createdAt,
       uploadedByFirstName: profiles.firstName,
       uploadedByLastName: profiles.lastName,

@@ -1,5 +1,8 @@
 "use client";
 
+import type { ScriptDocumentOption } from "@/features/scripts/queries";
+import { ScriptSwitcher } from "./script-switcher";
+
 import {
   useCallback,
   useEffect,
@@ -71,6 +74,9 @@ type Props = {
   /** Enable the freehand drawing palette (true on phones; false for the
    *  desktop Read-mode overlay, which is reading-only). */
   allowDrawing?: boolean;
+  /** All of the production's scripts; a switcher replaces the title when > 1. */
+  scripts?: ScriptDocumentOption[];
+  activeScriptId?: string;
 };
 
 export function MobileScriptReader({
@@ -85,6 +91,8 @@ export function MobileScriptReader({
   onBookmarksChange,
   startPage,
   allowDrawing = true,
+  scripts,
+  activeScriptId,
 }: Props) {
   const router = useRouter();
   const exit = useCallback(() => {
@@ -488,7 +496,19 @@ export function MobileScriptReader({
         <span className="msr-brand" aria-hidden="true">
           P
         </span>
-        <div className="msr-title">{title}</div>
+        <div className="msr-title">
+          {scripts && scripts.length > 1 ? (
+            <ScriptSwitcher
+              productionId={productionId}
+              scripts={scripts}
+              activeScriptId={activeScriptId ?? scriptId}
+              canManage={false}
+              compact
+            />
+          ) : (
+            title
+          )}
+        </div>
         <button
           className="msr-icon"
           data-on={isBookmarked(currentPage) ? "1" : "0"}

@@ -11,6 +11,7 @@ import {
   sceneBeats,
   productionMemberships,
   productions,
+  scriptPreferences,
 } from "@/db/schema";
 import { and, desc, eq, gte, inArray, isNull, ne } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -30,9 +31,17 @@ import {
   DESIGNER_PARSE_LIMIT_PER_PRODUCTION,
   DESIGNER_PARSE_LIMIT_PER_USER,
   ORG_PARSE_LIMIT_PER_MONTH,
+  DEAD_HEARTBEAT_MS,
+  countsTowardQuota,
   type Bookmark,
   type ScriptParseResult,
+  type ParseProgress,
+  type SplitRanges,
 } from "./constants";
+import { hasPendingChunks, validateSplitRanges } from "./parse-utils";
+import { loadPdf, extractPageRange } from "./pdf-split";
+
+type CurrentUser = Awaited<ReturnType<typeof requireCurrentUser>>;
 
 export type SetDefaultScriptResult = { error?: string; success?: boolean };
 
@@ -213,21 +222,23 @@ export async function dismissStaleBanner(
 // The async run worker can die without ever flipping the row off "processing"
 // (Vercel reclaims the function, or the work exceeds maxDuration=300s). Such a
 // row would otherwise spin the review page forever AND block every future parse
-// via the concurrency lock. Anything still "processing" past this deadline is
-// treated as dead. 8 min = maxDuration plus generous headroom.
+// via the concurrency lock. A running worker heartbeats `updated_at` every
+// HEARTBEAT_MS, and a long book is processed across several invocations, so
+// staleness is measured from the LAST heartbeat, not from creation: anything
+// still "processing" with no heartbeat for this long is dead.
 const STALE_PARSE_MS = 8 * 60 * 1000;
 const STALE_PARSE_ERROR =
-  "The analysis timed out. Long scripts can take a couple of minutes — please try again.";
+  "The analysis stopped responding. Long scripts can take several minutes — please try again.";
 
-function isStaleProcessing(row: { status: string; createdAt: Date }): boolean {
+function isStaleProcessing(row: { status: string; updatedAt: Date }): boolean {
   return (
     row.status === "processing" &&
-    Date.now() - new Date(row.createdAt).getTime() > STALE_PARSE_MS
+    Date.now() - new Date(row.updatedAt).getTime() > STALE_PARSE_MS
   );
 }
 
 /** True if a parse is genuinely still running (processing and not past the deadline). */
-function hasLiveProcessing(rows: { status: string; createdAt: Date }[]): boolean {
+function hasLiveProcessing(rows: { status: string; updatedAt: Date }[]): boolean {
   return rows.some((r) => r.status === "processing" && !isStaleProcessing(r));
 }
 
@@ -240,13 +251,19 @@ function hasLiveProcessing(rows: { status: string; createdAt: Date }[]): boolean
 async function failIfStale(row: {
   id: string;
   status: string;
-  createdAt: Date;
+  updatedAt: Date;
   documentId: string | null;
 }): Promise<boolean> {
   if (!isStaleProcessing(row)) return false;
   await db
     .update(scriptParses)
-    .set({ status: "failed", error: STALE_PARSE_ERROR, updatedAt: new Date() })
+    .set({
+      status: "failed",
+      error: STALE_PARSE_ERROR,
+      leaseToken: null,
+      leaseExpiresAt: null,
+      updatedAt: new Date(),
+    })
     .where(
       and(eq(scriptParses.id, row.id), eq(scriptParses.status, "processing")),
     );
@@ -260,6 +277,62 @@ async function failIfStale(row: {
 }
 
 export type StartScriptParseResult = { error?: string; parseId?: string };
+
+/**
+ * Cost guardrails shared by every way of staging a parse: one live parse at
+ * a time per production, a rolling per-production cap (tighter for designer
+ * seats, plus their account-wide cap), and the org-wide monthly backstop.
+ * Returns the user-facing reason the parse can't start, or null when it can.
+ * Only parses that actually ran the model count (`countsTowardQuota`).
+ */
+async function checkParseQuota(
+  user: CurrentUser,
+  productionId: string,
+): Promise<string | null> {
+  const since = new Date(Date.now() - PARSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  const recent = await db
+    .select({ status: scriptParses.status, updatedAt: scriptParses.updatedAt })
+    .from(scriptParses)
+    .where(
+      and(
+        eq(scriptParses.productionId, productionId),
+        gte(scriptParses.createdAt, since),
+      ),
+    );
+  // A dead-but-still-"processing" row (worker died) must not lock out new parses.
+  if (hasLiveProcessing(recent)) {
+    return "An analysis is already running for this production — give it a minute.";
+  }
+  const designer = isDesignerOnly(user);
+  const perProductionLimit = designer
+    ? DESIGNER_PARSE_LIMIT_PER_PRODUCTION
+    : PARSE_LIMIT_PER_PRODUCTION;
+  const used = recent.filter((r) => countsTowardQuota(r.status)).length;
+  if (used >= perProductionLimit) {
+    return designer
+      ? `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_PRODUCTION} AI analysis per project. You've used it for this show.`
+      : `You've reached the limit of ${PARSE_LIMIT_PER_PRODUCTION} AI analyses for this production in ${PARSE_WINDOW_DAYS} days.`;
+  }
+
+  // Designers also have an account-wide cap across all their projects.
+  if (designer) {
+    const acrossProjects = await db
+      .select({ status: scriptParses.status })
+      .from(scriptParses)
+      .where(
+        and(
+          eq(scriptParses.requestedBy, user.id),
+          gte(scriptParses.createdAt, since),
+          ne(scriptParses.status, "failed"),
+        ),
+      );
+    if (acrossProjects.filter((r) => countsTowardQuota(r.status)).length >= DESIGNER_PARSE_LIMIT_PER_USER) {
+      return `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_USER} AI analyses per ${PARSE_WINDOW_DAYS} days across your projects. You've reached it — try again later.`;
+    }
+  }
+
+  return orgParseBudgetError(user.organizationId);
+}
 
 /**
  * Org-wide denial-of-wallet backstop. The per-production and per-designer caps
@@ -329,57 +402,8 @@ export async function startScriptParse(
     return { error: "AI analysis supports PDF scripts only." };
   }
 
-  // Cost guardrails: one parse at a time per production, and a rolling cap.
-  const since = new Date(Date.now() - PARSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-  const recent = await db
-    .select({ status: scriptParses.status, createdAt: scriptParses.createdAt })
-    .from(scriptParses)
-    .where(
-      and(
-        eq(scriptParses.productionId, productionId),
-        gte(scriptParses.createdAt, since),
-      ),
-    );
-  // A dead-but-still-"processing" row (worker died) must not lock out new parses.
-  if (hasLiveProcessing(recent)) {
-    return { error: "An analysis is already running for this production — give it a minute." };
-  }
-  // Count only parses that actually ran (failed-before-the-model rows are free
-  // and shouldn't burn quota).
-  const designer = isDesignerOnly(user);
-  const perProductionLimit = designer
-    ? DESIGNER_PARSE_LIMIT_PER_PRODUCTION
-    : PARSE_LIMIT_PER_PRODUCTION;
-  const used = recent.filter((r) => r.status !== "failed").length;
-  if (used >= perProductionLimit) {
-    return {
-      error: designer
-        ? `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_PRODUCTION} AI analysis per project. You've used it for this show.`
-        : `You've reached the limit of ${PARSE_LIMIT_PER_PRODUCTION} AI analyses for this production in ${PARSE_WINDOW_DAYS} days.`,
-    };
-  }
-
-  // Designers also have an account-wide cap across all their projects.
-  if (designer) {
-    const acrossProjects = await db
-      .select({ id: scriptParses.id })
-      .from(scriptParses)
-      .where(
-        and(
-          eq(scriptParses.requestedBy, user.id),
-          gte(scriptParses.createdAt, since),
-          ne(scriptParses.status, "failed"),
-        ),
-      );
-    if (acrossProjects.length >= DESIGNER_PARSE_LIMIT_PER_USER) {
-      return {
-        error: `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_USER} AI analyses per ${PARSE_WINDOW_DAYS} days across your projects. You've reached it — try again later.`,
-      };
-    }
-  }
-
-  const orgBudgetError = await orgParseBudgetError(user.organizationId);
-  if (orgBudgetError) return { error: orgBudgetError };
+  const quotaError = await checkParseQuota(user, productionId);
+  if (quotaError) return { error: quotaError };
 
   const [parse] = await db
     .insert(scriptParses)
@@ -432,50 +456,8 @@ export async function reparseWithNotes(
   const lock = await assertCanMutate(user.organizationId, "script");
   if (lock.error) return { error: lock.error };
 
-  const since = new Date(Date.now() - PARSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-  const recent = await db
-    .select({ status: scriptParses.status, createdAt: scriptParses.createdAt })
-    .from(scriptParses)
-    .where(
-      and(
-        eq(scriptParses.productionId, productionId),
-        gte(scriptParses.createdAt, since),
-      ),
-    );
-  if (hasLiveProcessing(recent)) {
-    return { error: "An analysis is already running for this production — give it a minute." };
-  }
-  const designer = isDesignerOnly(user);
-  const perProductionLimit = designer
-    ? DESIGNER_PARSE_LIMIT_PER_PRODUCTION
-    : PARSE_LIMIT_PER_PRODUCTION;
-  if (recent.filter((r) => r.status !== "failed").length >= perProductionLimit) {
-    return {
-      error: designer
-        ? `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_PRODUCTION} AI analysis per project. You've used it for this show.`
-        : `You've reached the limit of ${PARSE_LIMIT_PER_PRODUCTION} AI analyses for this production in ${PARSE_WINDOW_DAYS} days.`,
-    };
-  }
-  if (designer) {
-    const acrossProjects = await db
-      .select({ id: scriptParses.id })
-      .from(scriptParses)
-      .where(
-        and(
-          eq(scriptParses.requestedBy, user.id),
-          gte(scriptParses.createdAt, since),
-          ne(scriptParses.status, "failed"),
-        ),
-      );
-    if (acrossProjects.length >= DESIGNER_PARSE_LIMIT_PER_USER) {
-      return {
-        error: `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_USER} AI analyses per ${PARSE_WINDOW_DAYS} days across your projects. You've reached it — try again later.`,
-      };
-    }
-  }
-
-  const orgBudgetError = await orgParseBudgetError(user.organizationId);
-  if (orgBudgetError) return { error: orgBudgetError };
+  const quotaError = await checkParseQuota(user, productionId);
+  if (quotaError) return { error: quotaError };
 
   const [row] = await db
     .insert(scriptParses)
@@ -545,6 +527,20 @@ export async function applyScriptParse(
   // Idempotent: re-applying an already-applied parse (double-click, retry) is a
   // no-op rather than a second insert of the same roles/scenes.
   if (parse.status === "applied") return { success: true };
+  if (parse.status !== "ready") {
+    return { error: "This analysis isn't ready to apply." };
+  }
+
+  // A vocal score's analysis is ADD-ONLY: it seeds musical-number bookmarks on
+  // the score document and adds roles the libretto missed (tagged
+  // source = "ai_score" so a later libretto apply, which replaces its own
+  // source = "ai" rows, never wipes them). It never touches scenes.
+  const [scriptDoc] = await db
+    .select({ scriptKind: documents.scriptKind })
+    .from(documents)
+    .where(eq(documents.id, documentId))
+    .limit(1);
+  const isScore = scriptDoc?.scriptKind === "vocal_score";
 
   // Re-parse semantics: a parse OWNS the rows it created (source = "ai") and
   // replaces them wholesale on the next parse, so re-analysing the same script
@@ -578,16 +574,19 @@ export async function applyScriptParse(
         ]),
     );
 
-    await tx
-      .delete(productionRoles)
-      .where(
-        and(
-          eq(productionRoles.productionId, productionId),
-          eq(productionRoles.source, "ai"),
-        ),
-      );
+    if (!isScore) {
+      await tx
+        .delete(productionRoles)
+        .where(
+          and(
+            eq(productionRoles.productionId, productionId),
+            eq(productionRoles.source, "ai"),
+          ),
+        );
+    }
 
-    // Manual roles that remain — don't create an AI row that collides by name.
+    // Roles that remain (manual, score-added, or — for a score apply — the
+    // libretto's) — don't create a row that collides by name.
     const manualRoles = await tx
       .select({ name: productionRoles.name })
       .from(productionRoles)
@@ -616,7 +615,7 @@ export async function applyScriptParse(
           const prior = assignmentByName.get(r.name.toLowerCase());
           return {
             productionId,
-            source: "ai",
+            source: isScore ? "ai_score" : "ai",
             ...r,
             assignedUserId: prior?.assignedUserId ?? null,
             actor: prior?.actor ?? null,
@@ -624,6 +623,9 @@ export async function applyScriptParse(
         }),
       );
     }
+
+    // A score apply never touches the scene list (the libretto owns it).
+    if (isScore) return;
 
     // ── Scenes ──────────────────────────────────────────────────────────
     // Scenes are shared with the blocking tool (scene_beats cascade-delete on
@@ -883,18 +885,46 @@ export async function ensureMemberBookmarks(
   return merged;
 }
 
-/** Poll target for the review page while a parse is processing. */
-export async function fetchLatestScriptParse(productionId: string) {
+/**
+ * Poll target for the review page while a parse is processing. Adds the
+ * chunk-progress summary and whether the parse is waiting on a kick
+ * (`resumable`): a long book is processed across several worker invocations,
+ * each of which releases the row's lease and self-kicks the run route; if that
+ * kick was lost, the poller re-POSTs `/run` (the lease makes a double-kick
+ * harmless).
+ */
+export async function fetchLatestScriptParse(
+  productionId: string,
+  documentId?: string | null,
+) {
   const user = await requireCurrentUser();
   if (!(await userCanAccessProduction(user, productionId))) return null;
   const { getLatestScriptParse } = await import("./queries");
-  const parse = await getLatestScriptParse(productionId);
+  const parse = await getLatestScriptParse(productionId, documentId ?? undefined);
+  if (!parse) return null;
   // Watchdog: if the worker died and left this spinning, fail it now so the
   // review page stops polling forever.
-  if (parse && (await failIfStale(parse))) {
-    return { ...parse, status: "failed", error: STALE_PARSE_ERROR };
+  if (await failIfStale(parse)) {
+    return { ...parse, status: "failed", error: STALE_PARSE_ERROR, resumable: false };
   }
-  return parse;
+  return { ...parse, resumable: isResumable(parse) };
+}
+
+function isResumable(parse: {
+  status: string;
+  updatedAt: Date;
+  leaseExpiresAt: Date | null;
+  progress: unknown;
+}): boolean {
+  if (parse.status !== "processing") return false;
+  const progress = parse.progress as ParseProgress | null;
+  if (!hasPendingChunks(progress)) return false;
+  const quietMs = Date.now() - new Date(parse.updatedAt).getTime();
+  // Lease released (worker yielded): give its own self-kick a moment first.
+  // Lease held but the heartbeat is dead: the route lets a kick steal it.
+  return parse.leaseExpiresAt
+    ? quietMs > DEAD_HEARTBEAT_MS
+    : quietMs > DEAD_HEARTBEAT_MS / 3;
 }
 
 export async function discardScriptParse(
@@ -927,6 +957,400 @@ export async function discardScriptParse(
       .where(eq(documents.id, parse.documentId));
   }
   return { success: true };
+}
+
+// ----- Split books (libretto + vocal score) and script switching -----
+
+/**
+ * Make `documentId` the production's default script WITHOUT bumping the
+ * script version or flagging annotations stale. That bump/flag (see
+ * `setDefaultScript`) is for "a new version of the same script replaced the
+ * old one"; switching between sibling scripts (libretto ↔ vocal score) or
+ * picking which of several uploads is the default is not that — every
+ * document keeps its own annotations, keyed by document id.
+ */
+async function assignDefaultScript(
+  executor: Pick<typeof db, "update">,
+  productionId: string,
+  documentId: string,
+): Promise<void> {
+  await executor
+    .update(documents)
+    .set({ isDefaultScript: false })
+    .where(
+      and(
+        eq(documents.productionId, productionId),
+        eq(documents.isDefaultScript, true),
+        ne(documents.id, documentId),
+      ),
+    );
+  await executor
+    .update(documents)
+    .set({ isDefaultScript: true })
+    .where(eq(documents.id, documentId));
+}
+
+/** A live script-type document of this production, or null. */
+async function findScriptDocument(productionId: string, documentId: string) {
+  const [doc] = await db
+    .select({ id: documents.id })
+    .from(documents)
+    .where(
+      and(
+        eq(documents.id, documentId),
+        eq(documents.productionId, productionId),
+        eq(documents.documentType, "script"),
+        isNull(documents.deletedAt),
+      ),
+    )
+    .limit(1);
+  return doc ?? null;
+}
+
+export type SimpleResult = { error?: string; success?: boolean };
+
+/**
+ * Managers: set which script the production opens by default (members who
+ * haven't picked their own). No version bump, no stale flag — see
+ * `assignDefaultScript`.
+ */
+export async function setProductionDefaultScript(
+  productionId: string,
+  documentId: string,
+): Promise<SimpleResult> {
+  const user = await requireCurrentUser();
+  if (!can(user.role, "documents:upload")) {
+    return { error: "You don't have permission to change the default script." };
+  }
+  if (!productionId || !documentId) return { error: "Missing required fields." };
+  if (!(await userCanAccessProduction(user, productionId))) {
+    return { error: "You don't have access to that production." };
+  }
+  const lock = await assertCanMutate(user.organizationId, "script");
+  if (lock.error) return { error: lock.error };
+  if (!(await findScriptDocument(productionId, documentId))) {
+    return { error: "Script not found for this production." };
+  }
+  await assignDefaultScript(db, productionId, documentId);
+  revalidatePath("/productions");
+  return { success: true };
+}
+
+/**
+ * Any member: choose which of the production's scripts THEY see (e.g. the
+ * vocal score while everyone else reads the libretto). `null` clears the
+ * choice so they follow the production default again. Stored per
+ * (user, production) in `script_preferences`; a deleted document falls back
+ * to the default automatically.
+ */
+export async function setMyActiveScript(
+  productionId: string,
+  documentId: string | null,
+): Promise<SimpleResult> {
+  const user = await requireCurrentUser();
+  if (!productionId) return { error: "Missing production." };
+  if (!(await userCanAccessProduction(user, productionId))) {
+    return { error: "You don't have access to that production." };
+  }
+  if (documentId && !(await findScriptDocument(productionId, documentId))) {
+    return { error: "Script not found for this production." };
+  }
+
+  const [existing] = await db
+    .select({ id: scriptPreferences.id })
+    .from(scriptPreferences)
+    .where(
+      and(
+        eq(scriptPreferences.userId, user.id),
+        eq(scriptPreferences.productionId, productionId),
+      ),
+    )
+    .limit(1);
+
+  if (!documentId) {
+    if (existing) {
+      await db.delete(scriptPreferences).where(eq(scriptPreferences.id, existing.id));
+    }
+  } else if (existing) {
+    await db
+      .update(scriptPreferences)
+      .set({ activeScriptId: documentId, updatedAt: new Date() })
+      .where(eq(scriptPreferences.id, existing.id));
+  } else {
+    await db.insert(scriptPreferences).values({
+      userId: user.id,
+      productionId,
+      activeScriptId: documentId,
+    });
+  }
+  revalidatePath("/productions");
+  return { success: true };
+}
+
+/**
+ * "Analyse as one book": the user declined the suggested split. Put the parse
+ * back into processing with detection skipped; the client then kicks `/run`.
+ */
+export async function continueParseUnsplit(
+  parseId: string,
+): Promise<StartScriptParseResult> {
+  const user = await requireCurrentUser();
+  if (!can(user.role, "documents:upload")) {
+    return { error: "You don't have permission to analyse scripts." };
+  }
+  const [parse] = await db
+    .select({
+      id: scriptParses.id,
+      productionId: scriptParses.productionId,
+      documentId: scriptParses.documentId,
+      status: scriptParses.status,
+      progress: scriptParses.progress,
+    })
+    .from(scriptParses)
+    .where(eq(scriptParses.id, parseId))
+    .limit(1);
+  if (!parse || !parse.productionId) return { error: "Analysis not found." };
+  if (!(await userCanAccessProduction(user, parse.productionId))) {
+    return { error: "You don't have access to that production." };
+  }
+  if (parse.status !== "split_suggested") {
+    return { error: "This analysis isn't waiting on a split decision." };
+  }
+  const progress = (parse.progress as ParseProgress | null) ?? null;
+  if (!progress) return { error: "This analysis can't be resumed — start a new one." };
+  const next: ParseProgress = { ...progress, skipDetect: true, phase: "analyse" };
+  await db
+    .update(scriptParses)
+    .set({
+      status: "processing",
+      progress: next,
+      leaseToken: null,
+      leaseExpiresAt: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(scriptParses.id, parseId), eq(scriptParses.status, "split_suggested")));
+  if (parse.documentId) {
+    await db
+      .update(documents)
+      .set({ processingStatus: "processing" })
+      .where(eq(documents.id, parse.documentId));
+  }
+  return { parseId };
+}
+
+export type SplitScriptResult = {
+  error?: string;
+  librettoDocumentId?: string;
+  vocalScoreDocumentId?: string;
+  /** The libretto analysis staged after the split, if quota allowed one. */
+  parseId?: string;
+  /** Why no analysis was staged (quota), when `parseId` is absent. */
+  note?: string;
+};
+
+/**
+ * Cut a combined book into two script documents at the user-confirmed page
+ * ranges. The original stays in Documents (marked "combined"); the libretto
+ * becomes the production default and gets an analysis staged (the score can
+ * be analysed from the review page's picker afterwards — one live parse per
+ * production). Idempotent: calling again after a successful split returns the
+ * documents already created.
+ */
+export async function splitScriptDocument(
+  parseId: string,
+  ranges: SplitRanges,
+): Promise<SplitScriptResult> {
+  const user = await requireCurrentUser();
+  if (!can(user.role, "documents:upload")) {
+    return { error: "You don't have permission to split scripts." };
+  }
+  const [parse] = await db
+    .select({
+      id: scriptParses.id,
+      productionId: scriptParses.productionId,
+      documentId: scriptParses.documentId,
+      status: scriptParses.status,
+      progress: scriptParses.progress,
+      pageCount: scriptParses.pageCount,
+    })
+    .from(scriptParses)
+    .where(eq(scriptParses.id, parseId))
+    .limit(1);
+  if (!parse || !parse.productionId || !parse.documentId) {
+    return { error: "Analysis not found." };
+  }
+  const productionId = parse.productionId;
+  const sourceDocumentId = parse.documentId;
+  if (!(await userCanAccessProduction(user, productionId))) {
+    return { error: "You don't have access to that production." };
+  }
+  const lock = await assertCanMutate(user.organizationId, "script");
+  if (lock.error) return { error: lock.error };
+
+  const progress = (parse.progress as ParseProgress | null) ?? null;
+  if (parse.status === "split" && progress?.split) {
+    return {
+      librettoDocumentId: progress.split.librettoDocumentId,
+      vocalScoreDocumentId: progress.split.vocalScoreDocumentId,
+    };
+  }
+  if (parse.status !== "split_suggested") {
+    return { error: "This analysis isn't waiting on a split decision." };
+  }
+  const pageCount = parse.pageCount ?? progress?.pageCount ?? 0;
+  if (pageCount < 2) return { error: "This file's page count is unknown — start a new analysis." };
+  const invalid = validateSplitRanges(ranges, pageCount);
+  if (invalid) return { error: invalid };
+
+  const [orig] = await db
+    .select({
+      title: documents.title,
+      fileName: documents.fileName,
+      storagePath: documents.storagePath,
+      folderId: documents.folderId,
+      contentType: documents.contentType,
+    })
+    .from(documents)
+    .where(
+      and(eq(documents.id, sourceDocumentId), eq(documents.productionId, productionId)),
+    )
+    .limit(1);
+  if (!orig) return { error: "The original script no longer exists." };
+  if (orig.contentType !== "application/pdf") return { error: "Only PDF scripts can be split." };
+
+  // Cut the two halves. pdf-lib is pure JS; a malformed file just fails here.
+  const supabase = createSupabaseAdminClient();
+  const { data: blob, error: dlError } = await supabase.storage
+    .from("attachments")
+    .download(orig.storagePath);
+  if (dlError || !blob) return { error: "Could not read the original script file." };
+  let librettoBytes: Uint8Array;
+  let scoreBytes: Uint8Array;
+  try {
+    const pdf = await loadPdf(new Uint8Array(await blob.arrayBuffer()));
+    if (pdf.getPageCount() < Math.max(ranges.libretto.endPage, ranges.vocalScore.endPage)) {
+      return { error: "The page ranges exceed the file's page count." };
+    }
+    librettoBytes = await extractPageRange(pdf, ranges.libretto);
+    scoreBytes = await extractPageRange(pdf, ranges.vocalScore);
+  } catch (err) {
+    console.error("splitScriptDocument: pdf-lib failed:", err);
+    return { error: "This PDF couldn't be split. Try re-saving it as a standard PDF and analysing again." };
+  }
+
+  const safeBase =
+    orig.fileName.replace(/\.pdf$/i, "").replace(/[^a-zA-Z0-9._-]/g, "_") || "script";
+  const stamp = Date.now();
+  const librettoPath = `documents/${productionId}/${stamp}-${safeBase}-libretto.pdf`;
+  const scorePath = `documents/${productionId}/${stamp}-${safeBase}-vocal-score.pdf`;
+  const up1 = await supabase.storage
+    .from("attachments")
+    .upload(librettoPath, Buffer.from(librettoBytes), { contentType: "application/pdf" });
+  if (up1.error) {
+    console.error("splitScriptDocument: upload failed:", up1.error.message);
+    return { error: "Could not save the libretto file. Please try again." };
+  }
+  const up2 = await supabase.storage
+    .from("attachments")
+    .upload(scorePath, Buffer.from(scoreBytes), { contentType: "application/pdf" });
+  if (up2.error) {
+    console.error("splitScriptDocument: upload failed:", up2.error.message);
+    await supabase.storage.from("attachments").remove([librettoPath]);
+    return { error: "Could not save the vocal-score file. Please try again." };
+  }
+
+  const baseTitle = orig.title.trim() || "Script";
+  const ids = await db.transaction(async (tx) => {
+    const [lib] = await tx
+      .insert(documents)
+      .values({
+        productionId,
+        uploadedBy: user.id,
+        folderId: orig.folderId ?? undefined,
+        title: `${baseTitle} — Libretto`,
+        fileName: `${safeBase}-libretto.pdf`,
+        fileSize: librettoBytes.byteLength,
+        contentType: "application/pdf",
+        storagePath: librettoPath,
+        documentType: "script",
+        scriptKind: "libretto",
+        sourceDocumentId,
+        sourcePageStart: ranges.libretto.startPage,
+        sourcePageEnd: ranges.libretto.endPage,
+        pageCount: ranges.libretto.endPage - ranges.libretto.startPage + 1,
+        processingStatus: "none",
+      })
+      .returning({ id: documents.id });
+    const [score] = await tx
+      .insert(documents)
+      .values({
+        productionId,
+        uploadedBy: user.id,
+        folderId: orig.folderId ?? undefined,
+        title: `${baseTitle} — Vocal score`,
+        fileName: `${safeBase}-vocal-score.pdf`,
+        fileSize: scoreBytes.byteLength,
+        contentType: "application/pdf",
+        storagePath: scorePath,
+        documentType: "script",
+        scriptKind: "vocal_score",
+        sourceDocumentId,
+        sourcePageStart: ranges.vocalScore.startPage,
+        sourcePageEnd: ranges.vocalScore.endPage,
+        pageCount: ranges.vocalScore.endPage - ranges.vocalScore.startPage + 1,
+        processingStatus: "none",
+      })
+      .returning({ id: documents.id });
+    await tx
+      .update(documents)
+      .set({ scriptKind: "combined", isDefaultScript: false, processingStatus: "none" })
+      .where(eq(documents.id, sourceDocumentId));
+    await assignDefaultScript(tx, productionId, lib.id);
+    const next: ParseProgress = {
+      ...(progress ?? {
+        version: 1,
+        mode: "text",
+        pageCount,
+        phase: "detect",
+        chunks: [],
+        invocations: 0,
+      }),
+      split: { librettoDocumentId: lib.id, vocalScoreDocumentId: score.id },
+    };
+    await tx
+      .update(scriptParses)
+      .set({ status: "split", progress: next, leaseToken: null, leaseExpiresAt: null, updatedAt: new Date() })
+      .where(eq(scriptParses.id, parseId));
+    return { librettoDocumentId: lib.id, vocalScoreDocumentId: score.id };
+  });
+
+  // Stage the libretto's analysis straight away (the split itself spent no
+  // quota). If the caps block it, hand back the reason instead of failing.
+  const quotaError = await checkParseQuota(user, productionId);
+  let newParseId: string | undefined;
+  if (!quotaError) {
+    const [row] = await db
+      .insert(scriptParses)
+      .values({
+        productionId,
+        documentId: ids.librettoDocumentId,
+        requestedBy: user.id,
+        status: "processing",
+      })
+      .returning({ id: scriptParses.id });
+    newParseId = row.id;
+    await db
+      .update(documents)
+      .set({ processingStatus: "processing" })
+      .where(eq(documents.id, ids.librettoDocumentId));
+  }
+
+  revalidatePath("/productions");
+  return {
+    ...ids,
+    parseId: newParseId,
+    note: quotaError ?? undefined,
+  };
 }
 
 // ----- Wizard AI cast auto-fill (parse a script before the production exists) -----
@@ -994,7 +1418,7 @@ export async function startWizardScriptParse(
     Date.now() - WIZARD_PARSE_WINDOW_DAYS * 24 * 60 * 60 * 1000,
   );
   const recent = await db
-    .select({ status: scriptParses.status, createdAt: scriptParses.createdAt })
+    .select({ status: scriptParses.status, updatedAt: scriptParses.updatedAt })
     .from(scriptParses)
     .where(
       and(
@@ -1031,7 +1455,7 @@ export async function fetchScriptParseById(parseId: string) {
       status: scriptParses.status,
       result: scriptParses.result,
       error: scriptParses.error,
-      createdAt: scriptParses.createdAt,
+      updatedAt: scriptParses.updatedAt,
     })
     .from(scriptParses)
     .where(eq(scriptParses.id, parseId))
