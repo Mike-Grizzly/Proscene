@@ -9,7 +9,7 @@ import { can } from "@/lib/permissions";
 import { assertCanMutate } from "@/features/billing/guard";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyUploadMagicBytes } from "@/lib/upload-security";
-import { DEFAULT_FOLDERS, canViewFolder } from "./constants";
+import { canViewFolder } from "./constants";
 import { ROLES } from "@/types/roles";
 
 export type UploadDocumentResult = {
@@ -33,21 +33,6 @@ const ALLOWED_DOCUMENT_TYPES = [
   "application/vnd.ms-powerpoint",
   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 ];
-
-export async function createDefaultFolders(
-  productionId: string,
-  // Accepts either the base db or a transaction handle, so callers can include
-  // the default folders in a larger atomic production-setup transaction.
-  executor: Pick<typeof db, "insert"> = db,
-) {
-  await executor.insert(documentFolders).values(
-    DEFAULT_FOLDERS.map((name, i) => ({
-      productionId,
-      name,
-      sortOrder: i,
-    })),
-  );
-}
 
 export type CreateFolderResult = { error?: string; success?: boolean };
 

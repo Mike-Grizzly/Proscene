@@ -648,8 +648,11 @@ After the multi-tenant authorization pass (see decision-log 2026-06-05):
   People page would remove them everywhere. Decide the multi-org behavior:
   remove-from-this-org-only when the user has other memberships, vs. full
   delete only when this is their last org.
-- **`attachments` Storage bucket lockdown — code done, live rule flip
-  PENDING (do at launch cutover).** All server-side storage operations now go
+- **`attachments` Storage bucket lockdown — RESOLVED, verified live 2026-07-22.**
+  The 2026-07-22 security review confirmed via live SQL that `storage.objects`
+  has RLS enabled with ZERO policies and the `attachments` bucket is
+  `public=false` — the deny-all cutover described below is done. Kept for
+  history: *(original entry)* All server-side storage operations now go
   through the service-role admin client (`createSupabaseAdminClient`), which
   bypasses storage RLS; the browser only ever uses short-lived signed
   URLs/tokens minted server-side after an org-scoped access check. The

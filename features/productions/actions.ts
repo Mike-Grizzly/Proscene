@@ -28,7 +28,7 @@ import {
 } from "./wizard-constants";
 import { isValidProductionColor } from "./constants";
 import { wizardDeptRows } from "./departments";
-import { createDefaultFolders } from "@/features/documents/actions";
+import { createDefaultFolders } from "@/features/documents/folders";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { isValidEmail } from "@/features/members/validation";
 import {
