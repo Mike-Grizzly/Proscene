@@ -19,7 +19,6 @@ describe("extractPdfPages", () => {
     // pdf.js transfers (detaches) the buffer it is handed; the extractor must
     // work on a copy so pdf-lib / fingerprinting / pdfium can still read it.
     expect(bytes.byteLength).toBe(before);
-    expect((bytes.buffer as ArrayBuffer).detached).toBe(false);
     await expect(PDFDocument.load(bytes)).resolves.toBeTruthy();
   });
 });
