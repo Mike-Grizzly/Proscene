@@ -255,13 +255,24 @@ export type ParseProgress = {
   // Kind of book being analysed (prompt hint). From documents.script_kind or
   // from a single-kind detection result.
   kindHint?: "libretto" | "vocal_score" | null;
+  // Which engine cut the scan into chunks: pdf-lib sub-PDFs, the single
+  // signed-URL call, or pdfium page images (when pdf-lib can't open the file).
+  engine?: "pdf-lib" | "url" | "pdfium-raster";
+  // The pdf-lib error that forced the fallback, for diagnosis.
+  pdfLibError?: string;
   detect?: {
     sections: DetectSection[];
     proposal: SplitRanges | null;
     inputTokens: number;
     outputTokens: number;
   };
-  split?: { librettoDocumentId: string; vocalScoreDocumentId: string };
+  split?: {
+    librettoDocumentId: string;
+    vocalScoreDocumentId: string;
+    // True when the halves were rebuilt from page images (pdf-lib couldn't
+    // open the original, so pdfium rendered it): no text layer, as with scans.
+    rasterized?: boolean;
+  };
 };
 
 /** What the review page shows while a parse runs. */
@@ -281,6 +292,12 @@ export const MAX_SCRIPT_PAGES = 600;
 export const TEXT_CHUNK_CHARS = 450_000;
 export const SCAN_CHUNK_MAX_PAGES = 60;
 export const SCAN_CHUNK_MAX_BYTES = 18 * 1024 * 1024;
+// Raster fallback (pdfium renders pages → PNG images when pdf-lib can't open a
+// scan): fewer pages per call, since each page is a separate image block and
+// the whole base64 request must stay under Claude's 32 MB ceiling.
+export const RASTER_CHUNK_MAX_PAGES = 24;
+export const RASTER_CHUNK_MAX_BYTES = 20 * 1024 * 1024;
+export const RASTER_DETECT_SAMPLE_PAGES = 30;
 // Detection: a scanned libretto alone is never this long; a combined book is.
 export const SCAN_DETECT_MIN_PAGES = 160;
 export const SCAN_DETECT_SAMPLE_PAGES = 60;

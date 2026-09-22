@@ -586,6 +586,9 @@ function SplitDone({
       <p style={{ fontSize: 13, color: "var(--ink-3)", margin: "0 0 14px", lineHeight: 1.5 }}>
         The libretto is now the production&apos;s default script and the vocal score
         sits beside it — everyone can switch between them from the Script tab.
+        {result.rasterized
+          ? " This file couldn't be cut page-for-page, so both halves were rebuilt from page images (no text layer, like any scan)."
+          : ""}
         {result.parseId
           ? " The libretto analysis has started; the vocal score can be analysed from the picker above once it finishes."
           : result.note
