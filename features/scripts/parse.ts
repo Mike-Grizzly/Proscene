@@ -59,6 +59,14 @@ import {
 import { loadPdf, extractPages, extractPageRange } from "./pdf-split";
 import { openWithPdfium, renderPagesBounded, type RasterDoc } from "./pdf-raster";
 import { extractPdfPages } from "./pdf-text";
+import {
+  ANALYSIS_SCHEMA_TEXT,
+  ANALYSIS_SCHEMA_VISION,
+  SECTIONS_SCHEMA,
+  SAMPLE_PAGES_SCHEMA,
+  FIRST_PAGE_SCHEMA,
+  type JsonSchema,
+} from "./schemas";
 
 // Text-layer threshold: a PDF with (almost) no embedded text is a scan.
 const SCANNED_TEXT_THRESHOLD = 200;
@@ -88,7 +96,7 @@ const SYSTEM_PROMPT = `You analyse theatrical scripts and musical-theatre libret
 Produce four things:
 1. roles — every named speaking/singing character. Classify each as Principal (large role, drives the plot, sings/speaks frequently), Supporting (named role with meaningful but smaller presence), or Ensemble (chorus, named groups, or one-scene bit parts). Use the character name as it appears in the script (e.g. "Frederic", not "FREDERIC:"). Do not invent characters; do not list stage directions, narrators of headings, or props as characters. Each character appears once.
 2. scenes — the Act/Scene structure in reading order. actNumber and sceneNumber are 1-based integers; for a single-act play use actNumber 1 throughout. title is a short scene label (the script's own scene heading if present, otherwise a brief setting like "The town square").
-3. bookmarks — one entry per scene start (kind "scene") and per musical number / song (kind "song"). Do NOT return a page number. Instead return an "anchor": a short, EXACT, verbatim quote (3–8 words) copied character-for-character from the script at that point — the scene heading or the song's title/number line as printed (e.g. "No. 7 — Poor Wandering One" or "ACT II, SCENE 1"). The anchor MUST appear verbatim in the script text so it can be located; if you can't quote it exactly, omit that bookmark. For song titles and numbers, copy the script's own printed label exactly — never renumber, re-letter, or invent a sequence. Only mark genuine scene/song starts, not every page or stage direction. IMPORTANT: front-matter listing pages — a table of contents, a "Musical Numbers" list, a synopsis/list of scenes — are reference only. Use them to understand the structure, but create exactly ONE bookmark per scene/song at its ACTUAL start in the body of the script, never a bookmark for its entry in such a list.
+3. bookmarks — one entry per scene start (kind "scene") and per musical number / song (kind "song"). Do NOT return a page number. Instead return an "anchor": a short, EXACT, verbatim quote (3–8 words) copied character-for-character from the script at that point — the scene heading or the song's title/number line as printed (e.g. "No. 7 — Poor Wandering One" or "ACT II, SCENE 1"). The anchor MUST appear verbatim in the script text so it can be located; if you can't quote it exactly, omit that bookmark. For song titles and numbers, copy the script's own printed label exactly — never renumber, re-letter, or invent a sequence. Prefer an anchor that contains no double-quote characters (pick a nearby run of words if the heading has them). Only mark genuine scene/song starts, not every page or stage direction. IMPORTANT: front-matter listing pages — a table of contents, a "Musical Numbers" list, a synopsis/list of scenes — are reference only. Use them to understand the structure, but create exactly ONE bookmark per scene/song at its ACTUAL start in the body of the script, never a bookmark for its entry in such a list.
 
 If the script is not actually a script (e.g. a contract or a flyer), return empty arrays.
 
@@ -206,10 +214,72 @@ type RawAnalysis = {
   bookmarks?: { kind?: string; title?: string; anchor?: string; page?: number }[];
 };
 
-function parseAnalysis(message: Anthropic.Message): RawAnalysis {
-  const raw = JSON.parse(extractJson(textFromMessage(message))) as RawAnalysis;
-  if (!Array.isArray(raw.roles) || !Array.isArray(raw.scenes)) {
-    throw new Error("The analysis came back in an unexpected format.");
+function jsonFormat(schema: JsonSchema): Anthropic.OutputConfig {
+  return { format: { type: "json_schema", schema } };
+}
+
+/** A reply we could not turn into the expected JSON — "re-analyse", never "split the file". */
+export class ReplyFormatError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReplyFormatError";
+  }
+}
+
+/**
+ * Parse the model's JSON reply. If it's still unparseable (shouldn't happen
+ * with a schema, but the API can fall back to free text under some
+ * conditions), make ONE cheap repair call that only rewrites the broken text
+ * under the same schema — far cheaper than re-reading the pages.
+ */
+async function parseJsonReply<T>(
+  client: Anthropic,
+  message: Anthropic.Message,
+  schema: JsonSchema,
+): Promise<T> {
+  if (message.stop_reason === "max_tokens") {
+    throw new ReplyFormatError(
+      "The AI's reply was too long to finish. Use Re-analyse; if it keeps happening, split the file into acts.",
+    );
+  }
+  const text = textFromMessage(message);
+  try {
+    return JSON.parse(extractJson(text)) as T;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error("Model reply was not valid JSON; attempting repair:", detail);
+    try {
+      const repaired = await client.messages.stream(
+        {
+          model: SCRIPT_PARSE_MODEL,
+          max_tokens: 16000,
+          system:
+            "You repair JSON. Return the given text as valid JSON matching the required shape — escape quotes inside strings, fix missing commas/brackets, and change nothing else. No commentary.",
+          messages: [{ role: "user", content: text }],
+          output_config: jsonFormat(schema),
+        },
+        { timeout: CHUNK_CALL_TIMEOUT_MS },
+      ).finalMessage();
+      return JSON.parse(extractJson(textFromMessage(repaired))) as T;
+    } catch (err2) {
+      const detail2 = err2 instanceof Error ? err2.message : String(err2);
+      throw new ReplyFormatError(
+        `The AI's reply couldn't be read (${detail2}). Use Re-analyse to try again.`,
+      );
+    }
+  }
+}
+
+async function parseAnalysis(
+  client: Anthropic,
+  message: Anthropic.Message,
+  schema: JsonSchema,
+): Promise<RawAnalysis> {
+  const raw = await parseJsonReply<RawAnalysis>(client, message, schema);
+  if (!raw || !Array.isArray(raw.roles) || !Array.isArray(raw.scenes)) {
+    throw new ReplyFormatError(
+      "The analysis came back in an unexpected format. Use Re-analyse to try again.",
+    );
   }
   return raw;
 }
@@ -239,11 +309,12 @@ async function runTextChunk(
           content: `${input.preface}Analyse this script (${input.pageCount} pages):\n${tagged}`,
         },
       ],
+      output_config: jsonFormat(ANALYSIS_SCHEMA_TEXT),
     },
     { timeout: CHUNK_CALL_TIMEOUT_MS },
   );
   const message = await stream.finalMessage();
-  const raw = parseAnalysis(message);
+  const raw = await parseAnalysis(client, message, ANALYSIS_SCHEMA_TEXT);
   // Page numbers are resolved in code from anchors within THIS chunk's pages
   // (never trusted from the model), then shifted to absolute pages.
   const local = resolveBookmarks(
@@ -309,11 +380,12 @@ async function runScanChunk(
           ],
         },
       ],
+      output_config: jsonFormat(ANALYSIS_SCHEMA_VISION),
     },
     { timeout: CHUNK_CALL_TIMEOUT_MS },
   );
   const message = await stream.finalMessage();
-  const raw = parseAnalysis(message);
+  const raw = await parseAnalysis(client, message, ANALYSIS_SCHEMA_VISION);
   // No text layer to anchor against on a scan — trust the model's page number
   // but validate it points at a real page of the excerpt, then offset.
   const local = resolveVisionBookmarks(
@@ -383,6 +455,7 @@ async function detectTextSections(
             digest,
         },
       ],
+      output_config: jsonFormat(SECTIONS_SCHEMA),
     },
     { timeout: CHUNK_CALL_TIMEOUT_MS },
   );
@@ -390,7 +463,7 @@ async function detectTextSections(
   const usage = usageOf(message);
   let sections = heuristic;
   try {
-    const raw = JSON.parse(extractJson(textFromMessage(message))) as { sections?: unknown };
+    const raw = await parseJsonReply<{ sections?: unknown }>(client, message, SECTIONS_SCHEMA);
     const clean = sanitizeSections(raw.sections, pages.length);
     if (clean && isMixedBook(clean)) sections = clean;
   } catch {
@@ -449,14 +522,17 @@ async function detectScanSections(
           ],
         },
       ],
+      output_config: jsonFormat(SAMPLE_PAGES_SCHEMA),
     },
     { timeout: CHUNK_CALL_TIMEOUT_MS },
   );
   const message = await stream.finalMessage();
   ({ input: inputTokens, output: outputTokens } = usageOf(message));
-  const raw = JSON.parse(extractJson(textFromMessage(message))) as {
-    pages?: { i?: number; kind?: string }[];
-  };
+  const raw = await parseJsonReply<{ pages?: { i?: number; kind?: string }[] }>(
+    client,
+    message,
+    SAMPLE_PAGES_SCHEMA,
+  );
   const samples = (Array.isArray(raw.pages) ? raw.pages : [])
     .map((p) => {
       const i = Math.round(Number(p.i));
@@ -508,6 +584,7 @@ async function detectScanSections(
               ],
             },
           ],
+          output_config: jsonFormat(FIRST_PAGE_SCHEMA),
         },
         { timeout: CHUNK_CALL_TIMEOUT_MS },
       );
@@ -515,7 +592,7 @@ async function detectScanSections(
       const u2 = usageOf(m2);
       inputTokens += u2.input;
       outputTokens += u2.output;
-      const r2 = JSON.parse(extractJson(textFromMessage(m2))) as { firstPage?: number };
+      const r2 = await parseJsonReply<{ firstPage?: number }>(client, m2, FIRST_PAGE_SCHEMA);
       const first = Math.round(Number(r2.firstPage));
       if (Number.isFinite(first) && first >= 1 && first <= windowEnd - windowStart + 1) {
         const boundary = windowStart + first - 1;
@@ -1026,6 +1103,9 @@ export async function runScriptParse(
         console.error(`Script parse chunk ${chunk.index + 1}/${total} failed:`, err);
         chunk.status = "failed";
         if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
+          if (err instanceof ReplyFormatError) {
+            throw new Error(`Pages ${chunk.startPage}–${chunk.endPage}: ${err.message}`);
+          }
           const detail = err instanceof Error ? ` (${err.message})` : "";
           throw new Error(
             `Pages ${chunk.startPage}–${chunk.endPage} could not be analysed${detail}. Try splitting the file at that point.`,

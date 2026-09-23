@@ -3070,3 +3070,28 @@ with a production default, add-only score analysis.
 **Impact:** migration `script_split_and_chunked_parse` applied live (Supabase
 MCP); `pdf-lib` added; 26 vitest cases for the pure helpers. Not live-verified
 — see open-questions (2026-09-22).
+
+---
+
+## 2026-09-23 — AI parse replies are schema-enforced; a searchable rebuild inherits its scan's applied analysis
+
+**Context:** the second live round on the owner's book: the in-app split and
+scan-libretto parse worked, but re-analysing the OCR'd "(searchable)" copy
+failed twice with malformed JSON (OCR's stray quotes copied verbatim into
+anchors), and the rebuilt document had no bookmarks because analyses and
+bookmarks are per document.
+
+**Decisions:**
+1. **Structured outputs everywhere.** All five model calls pass a strict JSON
+   schema via `output_config.format` (non-beta in SDK 0.103 — this reverses
+   the 2026-06-09 "beta-only" note). Grammar-constrained output removes the
+   whole class of "reply couldn't be parsed" failures; a single repair call is
+   the fallback, and format failures tell the user to Re-analyse rather than
+   split the file.
+2. **"Make searchable" carries the analysis over.** The rebuild is a 1:1 page
+   render, so `finalizeRebuiltScript` clones the source scan's applied parse
+   (`progress.clonedFrom`, no fingerprint, excluded from quota) and seeds the
+   AI bookmarks for every member; members' script preferences follow. The
+   rebuild also inherits `script_kind`, `page_count` and provenance.
+3. Bookmark seeding lives in a plain server module (`bookmarks.ts`) shared by
+   apply and rebuild; the pure id/shape helper lives in `parse-utils.ts`.

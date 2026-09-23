@@ -260,6 +260,10 @@ export type ParseProgress = {
   engine?: "pdf-lib" | "url" | "pdfium-raster";
   // The pdf-lib error that forced the fallback, for diagnosis.
   pdfLibError?: string;
+  // Set on a parse row cloned onto a searchable rebuild of the source
+  // document (id of the original parse). Clones never ran the model and never
+  // count toward the analysis caps.
+  clonedFrom?: string;
   detect?: {
     sections: DetectSection[];
     proposal: SplitRanges | null;

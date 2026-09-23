@@ -209,7 +209,7 @@ export type ScriptParseTarget = Awaited<ReturnType<typeof getScriptParseTargets>
 export async function getProductionParseUsage(productionId: string) {
   const since = new Date(Date.now() - PARSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const recent = await db
-    .select({ status: scriptParses.status })
+    .select({ status: scriptParses.status, progress: scriptParses.progress })
     .from(scriptParses)
     .where(
       and(
@@ -217,7 +217,11 @@ export async function getProductionParseUsage(productionId: string) {
         gte(scriptParses.createdAt, since),
       ),
     );
-  const used = recent.filter((r) => countsTowardQuota(r.status)).length;
+  const used = recent.filter(
+    (r) =>
+      countsTowardQuota(r.status) &&
+      !(r.progress as { clonedFrom?: string } | null)?.clonedFrom,
+  ).length;
   return {
     used,
     limit: PARSE_LIMIT_PER_PRODUCTION,

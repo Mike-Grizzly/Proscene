@@ -24,8 +24,10 @@ export async function installSearchableScript(opts: {
   title: string;
   onProgress?: (p: RebuildProgress) => void;
   signal?: { cancelled: boolean };
+  /** The scan being rebuilt, so the rebuild inherits its applied analysis. */
+  sourceDocumentId?: string;
 }): Promise<{ error?: string; cancelled?: boolean }> {
-  const { productionId, file, baseName, title, onProgress, signal } = opts;
+  const { productionId, file, baseName, title, onProgress, signal, sourceDocumentId } = opts;
 
   const blob = file.type.startsWith("image/")
     ? await rebuildImageAsSearchablePdf(file, { onProgress, signal })
@@ -54,6 +56,7 @@ export async function installSearchableScript(opts: {
     title: title ? `${title} (searchable)` : "Script (searchable)",
     fileName: outName,
     fileSize: blob.size,
+    sourceDocumentId,
   });
   if (fin.error) return { error: fin.error };
 

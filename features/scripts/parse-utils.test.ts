@@ -14,6 +14,7 @@ import {
   sanitizeSections,
   progressSummary,
   buildChunkPreface,
+  aiBookmarksFromResult,
   type PageClass,
 } from "./parse-utils";
 import { countsTowardQuota, type ChunkResult, type ParseProgress } from "./constants";
@@ -267,5 +268,24 @@ describe("progress + quota helpers", () => {
     expect(preface).toContain("Act 1, Scene 2");
     expect(preface).toContain("WITHIN THIS EXCERPT");
     expect(buildChunkPreface({ chunk: { startPage: 1, endPage: 100 }, index: 0, total: 1, pageCount: 100, mode: "text", carry: { roles: [], lastScene: null }, kindHint: null })).toBe("");
+  });
+});
+
+describe("aiBookmarksFromResult", () => {
+  it("gives AI bookmarks stable ai-* ids and drops invalid pages", () => {
+    const out = aiBookmarksFromResult({
+      title: "",
+      roles: [],
+      scenes: [],
+      bookmarks: [
+        { page: 3, title: "Overture", kind: "song" },
+        { page: 0, title: "bad", kind: "scene" },
+        { page: 7.9, title: "", kind: "scene" },
+      ],
+    });
+    expect(out.map((b) => [b.id, b.page, b.title, b.kind])).toEqual([
+      ["ai-3-0", 3, "Overture", "song"],
+      ["ai-7.9-1", 7, "Page 7", "scene"],
+    ]);
   });
 });
