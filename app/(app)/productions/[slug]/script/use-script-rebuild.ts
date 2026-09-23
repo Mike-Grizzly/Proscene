@@ -16,6 +16,8 @@ interface Args {
   pdfUrl: string;
   title: string;
   fileName: string;
+  /** The scan being rebuilt (its applied analysis carries over). */
+  sourceDocumentId?: string;
 }
 
 /**
@@ -23,7 +25,7 @@ interface Args {
  * and installs it as the production's new default script. The page should
  * `router.refresh()` on `done` to pick up the new file.
  */
-export function useScriptRebuild({ productionId, pdfUrl, title, fileName }: Args) {
+export function useScriptRebuild({ productionId, pdfUrl, title, fileName, sourceDocumentId }: Args) {
   const [status, setStatus] = useState<RebuildStatus>("idle");
   const [progress, setProgress] = useState<RebuildProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -48,6 +50,7 @@ export function useScriptRebuild({ productionId, pdfUrl, title, fileName }: Args
         file,
         baseName: fileName || "script",
         title,
+        sourceDocumentId,
         onProgress: (p) => {
           // The hook surfaces "uploading" once page work is done.
           setProgress(p);
@@ -68,7 +71,7 @@ export function useScriptRebuild({ productionId, pdfUrl, title, fileName }: Args
       setError(e instanceof Error ? e.message : "Something went wrong.");
       setStatus("failed");
     }
-  }, [productionId, pdfUrl, title, fileName]);
+  }, [productionId, pdfUrl, title, fileName, sourceDocumentId]);
 
   return { status, progress, error, run, cancel };
 }

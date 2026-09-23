@@ -355,6 +355,33 @@ same session also made the scan path independent of it:
 - The pdf-lib error text is stored in `progress.pdfLibError` and included in
   the final failure message, so the next report is diagnosable from the DB.
 
+### Structured outputs + "Make searchable" inherits the analysis (2026-09-23)
+
+The owner's second live round: the in-app split and the scan libretto's parse
+**worked and were applied**. Then "Make searchable" (the PDFium + OCR rebuild,
+needed because pdf.js renders this 1-bit CCITT scan blank) created a new
+document with **no bookmarks**, and re-analysing that copy failed twice with
+malformed JSON from the model — the searchable copy has a text layer, so it
+took the text path, whose verbatim anchors copied OCR's stray `"` characters
+unescaped into JSON strings.
+
+- **Every model call now declares a strict JSON schema** via
+  `output_config.format` (`features/scripts/schemas.ts`; SDK 0.103, non-beta —
+  this reverses the 2026-06-09 note that structured outputs were beta-only).
+  Text/vision analysis, section confirmation, scan sampling and boundary
+  refinement each have one. If a reply still fails to parse, ONE cheap repair
+  call rewrites the broken text under the same schema before the chunk is
+  retried; `stop_reason = max_tokens` fails with "reply was too long". Format
+  errors now say "use Re-analyse", never "split the file".
+- **`finalizeRebuiltScript` inherits the source scan's analysis** when the
+  caller passes `sourceDocumentId` (the in-viewer "Make searchable" does; the
+  upload-time prompt has nothing to inherit): the rebuild copies `script_kind`,
+  `page_count` and provenance, and if the scan had an applied parse it gets a
+  **cloned parse row** (`status applied`, `progress.clonedFrom`, no
+  fingerprint, never counted toward the caps) plus the AI bookmarks seeded for
+  every member (`features/scripts/bookmarks.ts`), so the rebuilt script opens
+  bookmarked. Members who had picked the scan follow it to the rebuild.
+
 ### Limitations (v1)
 - One contiguous range per half: a book that alternates libretto / score per
   act can't be split cleanly — the proposal covers the largest run of each; the

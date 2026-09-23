@@ -1,8 +1,16 @@
 "use server";
 
 import { db } from "@/db";
-import { documents, scriptOcr, scriptAnnotations } from "@/db/schema";
+import {
+  documents,
+  scriptOcr,
+  scriptAnnotations,
+  scriptParses,
+  scriptPreferences,
+} from "@/db/schema";
 import { and, desc, eq } from "drizzle-orm";
+import { seedSharedBookmarks } from "./bookmarks";
+import type { ParseProgress, ScriptParseResult } from "./constants";
 import { requireCurrentUser, userCanAccessProduction } from "@/lib/auth";
 import { assertCanMutate } from "@/features/billing/guard";
 import { can } from "@/lib/permissions";
@@ -237,6 +245,14 @@ export async function finalizeRebuiltScript(input: {
   title: string;
   fileName: string;
   fileSize: number;
+  /**
+   * The scan this rebuild was made from. When given, the new document inherits
+   * its script kind / page count and — if that scan had an APPLIED analysis —
+   * the analysis itself: a cloned parse row plus the AI bookmarks seeded for
+   * every member, so "Make searchable" never loses the breakdown (pages are
+   * rendered 1:1). Members who had chosen the scan follow it to the rebuild.
+   */
+  sourceDocumentId?: string;
 }): Promise<FinalizeRebuiltScriptResult> {
   const user = await requireCurrentUser();
   if (!can(user.role, "documents:upload")) {
@@ -274,19 +290,109 @@ export async function finalizeRebuiltScript(input: {
       ),
     );
 
-  await db.insert(documents).values({
-    productionId: input.productionId,
-    uploadedBy: user.id,
-    title: input.title?.trim() || "Script (searchable)",
-    fileName: input.fileName,
-    fileSize: input.fileSize,
-    contentType: "application/pdf",
-    storagePath: input.storagePath,
-    documentType: "script",
-    isDefaultScript: true,
-    scriptVersion: nextVersion,
-    processingStatus: "ready",
-  });
+  // Source document (must belong to this production) and its applied analysis.
+  let source: {
+    id: string;
+    scriptKind: string | null;
+    pageCount: number | null;
+    sourceDocumentId: string | null;
+  } | null = null;
+  let applied: {
+    id: string;
+    result: unknown;
+    pageCount: number | null;
+    requestedBy: string | null;
+  } | null = null;
+  if (input.sourceDocumentId) {
+    const [src] = await db
+      .select({
+        id: documents.id,
+        scriptKind: documents.scriptKind,
+        pageCount: documents.pageCount,
+        sourceDocumentId: documents.sourceDocumentId,
+      })
+      .from(documents)
+      .where(
+        and(
+          eq(documents.id, input.sourceDocumentId),
+          eq(documents.productionId, input.productionId),
+        ),
+      )
+      .limit(1);
+    source = src ?? null;
+    if (source) {
+      const [ap] = await db
+        .select({
+          id: scriptParses.id,
+          result: scriptParses.result,
+          pageCount: scriptParses.pageCount,
+          requestedBy: scriptParses.requestedBy,
+        })
+        .from(scriptParses)
+        .where(
+          and(eq(scriptParses.documentId, source.id), eq(scriptParses.status, "applied")),
+        )
+        .orderBy(desc(scriptParses.updatedAt))
+        .limit(1);
+      applied = ap ?? null;
+    }
+  }
+
+  const [created] = await db
+    .insert(documents)
+    .values({
+      productionId: input.productionId,
+      uploadedBy: user.id,
+      title: input.title?.trim() || "Script (searchable)",
+      fileName: input.fileName,
+      fileSize: input.fileSize,
+      contentType: "application/pdf",
+      storagePath: input.storagePath,
+      documentType: "script",
+      isDefaultScript: true,
+      scriptVersion: nextVersion,
+      processingStatus: applied ? "applied" : "ready",
+      scriptKind: source?.scriptKind ?? null,
+      // Chain to the ORIGINAL upload so provenance survives repeated rebuilds.
+      sourceDocumentId: source ? (source.sourceDocumentId ?? source.id) : null,
+      pageCount: source?.pageCount ?? applied?.pageCount ?? null,
+    })
+    .returning({ id: documents.id });
+
+  if (source && applied?.result) {
+    const result = applied.result as ScriptParseResult;
+    const progress: ParseProgress = {
+      version: 1,
+      mode: "text",
+      pageCount: applied.pageCount ?? source.pageCount ?? 0,
+      phase: "analyse",
+      chunks: [],
+      invocations: 0,
+      clonedFrom: applied.id,
+    };
+    // Clone the applied analysis onto the rebuild: no model call, no cache
+    // fingerprint (never feeds the cache), never counts toward the caps.
+    await db.insert(scriptParses).values({
+      productionId: input.productionId,
+      documentId: created.id,
+      requestedBy: applied.requestedBy ?? user.id,
+      status: "applied",
+      result,
+      progress,
+      pageCount: progress.pageCount || null,
+    });
+    await seedSharedBookmarks(input.productionId, created.id, result, user.id);
+    // Members who had picked the scan explicitly follow it to the rebuild.
+    await db
+      .update(scriptPreferences)
+      .set({ activeScriptId: created.id, updatedAt: new Date() })
+      .where(
+        and(
+          eq(scriptPreferences.productionId, input.productionId),
+          eq(scriptPreferences.activeScriptId, source.id),
+        ),
+      );
+  }
 
   // Existing per-user annotations were anchored to the old (blank) render;
   // flag them stale so the viewer shows its "script updated" banner.

@@ -4,6 +4,7 @@
  * SDK, or server-only imports so every function here is unit-testable.
  */
 import type {
+  Bookmark,
   ChunkResult,
   DetectSection,
   DetectSectionKind,
@@ -627,3 +628,20 @@ export function sanitizeSections(
   if (cursor !== pageCount + 1) return null;
   return out;
 }
+
+// ── AI bookmark seeding ─────────────────────────────────────────────────────
+
+/** The shared, AI-seeded bookmark set derived from a parse result (stable `ai-*` ids). */
+export function aiBookmarksFromResult(result: ScriptParseResult): Bookmark[] {
+  const now = new Date().toISOString();
+  return result.bookmarks
+    .filter((b) => Number.isFinite(b.page) && b.page >= 1)
+    .map((b, i) => ({
+      id: `ai-${b.page}-${i}`,
+      page: Math.trunc(b.page),
+      title: (b.title ?? "").trim() || `Page ${Math.trunc(b.page)}`,
+      kind: b.kind === "song" ? ("song" as const) : ("scene" as const),
+      createdAt: now,
+    }));
+}
+

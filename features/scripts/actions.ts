@@ -9,7 +9,6 @@ import {
   productionRoles,
   productionScenes,
   sceneBeats,
-  productionMemberships,
   productions,
   scriptPreferences,
 } from "@/db/schema";
@@ -38,7 +37,8 @@ import {
   type ParseProgress,
   type SplitRanges,
 } from "./constants";
-import { hasPendingChunks, validateSplitRanges, pagesInRange } from "./parse-utils";
+import { hasPendingChunks, validateSplitRanges, pagesInRange, aiBookmarksFromResult } from "./parse-utils";
+import { seedSharedBookmarks } from "./bookmarks";
 import { loadPdf, extractPageRange, buildImagePdf } from "./pdf-split";
 import { openWithPdfium } from "./pdf-raster";
 
@@ -292,7 +292,11 @@ async function checkParseQuota(
 ): Promise<string | null> {
   const since = new Date(Date.now() - PARSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const recent = await db
-    .select({ status: scriptParses.status, updatedAt: scriptParses.updatedAt })
+    .select({
+      status: scriptParses.status,
+      updatedAt: scriptParses.updatedAt,
+      progress: scriptParses.progress,
+    })
     .from(scriptParses)
     .where(
       and(
@@ -304,11 +308,14 @@ async function checkParseQuota(
   if (hasLiveProcessing(recent)) {
     return "An analysis is already running for this production — give it a minute.";
   }
+  // Clones onto searchable rebuilds never ran the model.
+  const isClone = (r: { progress: unknown }) =>
+    !!(r.progress as ParseProgress | null)?.clonedFrom;
   const designer = isDesignerOnly(user);
   const perProductionLimit = designer
     ? DESIGNER_PARSE_LIMIT_PER_PRODUCTION
     : PARSE_LIMIT_PER_PRODUCTION;
-  const used = recent.filter((r) => countsTowardQuota(r.status)).length;
+  const used = recent.filter((r) => countsTowardQuota(r.status) && !isClone(r)).length;
   if (used >= perProductionLimit) {
     return designer
       ? `Your plan includes ${DESIGNER_PARSE_LIMIT_PER_PRODUCTION} AI analysis per project. You've used it for this show.`
@@ -734,77 +741,6 @@ export async function applyScriptParse(
 
   revalidatePath("/productions");
   return { success: true };
-}
-
-/** The shared, AI-seeded bookmark set derived from a parse result (stable `ai-*` ids). */
-function aiBookmarksFromResult(result: ScriptParseResult): Bookmark[] {
-  const now = new Date().toISOString();
-  return result.bookmarks
-    .filter((b) => Number.isFinite(b.page) && b.page >= 1)
-    .map((b, i) => ({
-      id: `ai-${b.page}-${i}`,
-      page: Math.trunc(b.page),
-      title: (b.title ?? "").trim() || `Page ${Math.trunc(b.page)}`,
-      kind: b.kind === "song" ? ("song" as const) : ("scene" as const),
-      createdAt: now,
-    }));
-}
-
-async function seedSharedBookmarks(
-  productionId: string,
-  scriptId: string,
-  result: ScriptParseResult,
-  requesterId: string,
-) {
-  const shared = aiBookmarksFromResult(result);
-  if (shared.length === 0) return;
-
-  const members = await db
-    .select({ userId: productionMemberships.userId })
-    .from(productionMemberships)
-    .where(eq(productionMemberships.productionId, productionId));
-  const userIds = new Set<string>([requesterId, ...members.map((m) => m.userId)]);
-
-  const existingRows = await db
-    .select({
-      userId: scriptAnnotations.userId,
-      bookmarks: scriptAnnotations.bookmarks,
-    })
-    .from(scriptAnnotations)
-    .where(eq(scriptAnnotations.scriptId, scriptId));
-  const byUser = new Map(existingRows.map((r) => [r.userId, r.bookmarks as Bookmark[]]));
-
-  for (const userId of userIds) {
-    const current = byUser.get(userId);
-    if (current === undefined) {
-      await db.insert(scriptAnnotations).values({
-        scriptId,
-        userId,
-        productionId,
-        bookmarks: shared,
-      });
-    } else {
-      // Replace the previous AI-seeded set (ids prefixed "ai-") with the new
-      // one, but preserve any bookmarks the user added themselves. This means a
-      // re-parse re-bookmarks from scratch instead of piling onto stale markers.
-      const userOwned = current.filter((b) => !b.id.startsWith("ai-"));
-      const merged = [...userOwned, ...shared];
-      const changed =
-        merged.length !== current.length ||
-        merged.some((b, i) => current[i]?.id !== b.id);
-      if (changed) {
-        await db
-          .update(scriptAnnotations)
-          .set({ bookmarks: merged, updatedAt: new Date() })
-          .where(
-            and(
-              eq(scriptAnnotations.scriptId, scriptId),
-              eq(scriptAnnotations.userId, userId),
-            ),
-          );
-      }
-    }
-  }
 }
 
 /**

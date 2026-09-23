@@ -370,6 +370,7 @@ export function ScriptViewer({
     pdfUrl,
     title: script.title ?? "",
     fileName: script.fileName ?? "script.pdf",
+    sourceDocumentId: script.id,
   });
   useEffect(() => {
     if (rebuild.status === "done") router.refresh();

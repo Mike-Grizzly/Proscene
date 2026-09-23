@@ -55,8 +55,16 @@ Built on `claude/loving-babbage-ggkydb` (spec: `feature-specs/19-ai-script-analy
 - **Alternating-section books** (libretto / score per act) can't be split
   cleanly in v1 — one contiguous range per half; the rest stays in the original.
   Revisit if it shows up in practice (would need multiple ranges per document).
-- **First live run failed (2026-09-22, same day) — root cause fixed, not yet
-  live-verified.** pdf.js detached the shared buffer, so pdf-lib saw an empty
+- **Round 3 (2026-09-23) — verify:** re-analyse the "(searchable)" libretto →
+  `ready` (text mode, one chunk, no JSON error); on the original scan libretto,
+  "Make searchable" → the new document opens with the AI bookmarks already
+  present and `processing_status = "applied"`, quota pill unchanged. If a
+  reply still can't be parsed, the failure text now names it and the fix is
+  "Re-analyse", not a split.
+- **Round 2 (2026-09-22) — VERIFIED live for the scan path:** the combined
+  282-page scan was split in-app and the scan libretto parsed (engine
+  `pdf-lib`, 3 chunks, 2 invocations) and applied. Kept below for history.
+- **First live run failed (2026-09-22, same day) — root cause fixed.** pdf.js detached the shared buffer, so pdf-lib saw an empty
   file (and every scan's fingerprint was `sha256("")` since June — the live
   cache had no such row, but check `script_cache` for fingerprint
   `e3b0c442…b855` if a scan ever returns a wrong cached breakdown). Confirm on
