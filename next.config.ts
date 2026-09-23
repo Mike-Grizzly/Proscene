@@ -46,6 +46,8 @@ const nextConfig: NextConfig = {
     "/api/scripts/[parseId]/run": PDFIUM_WASM,
     "/productions/[slug]/script/ai": PDFIUM_WASM,
     "/focus/[slug]": PDFIUM_WASM,
+    "/productions/[slug]/documents": PDFIUM_WASM,
+    "/productions/new": PDFIUM_WASM,
   },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];

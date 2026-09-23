@@ -10,6 +10,7 @@ import { assertCanMutate } from "@/features/billing/guard";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyUploadMagicBytes } from "@/lib/upload-security";
 import { DEFAULT_FOLDERS, canViewFolder } from "./constants";
+import { scheduleReadableCopy } from "@/features/scripts/readable";
 import { ROLES } from "@/types/roles";
 
 export type UploadDocumentResult = {
@@ -282,6 +283,16 @@ export async function finalizeDocumentUpload(input: {
       documentType: input.documentType || "general",
     })
     .returning({ id: documents.id });
+
+  // Scanned scripts the in-app viewer can't draw get a readable copy made in
+  // the background (no-op for text PDFs and ordinary scans).
+  if (
+    created &&
+    (input.documentType || "general") === "script" &&
+    input.contentType === "application/pdf"
+  ) {
+    await scheduleReadableCopy(created.id);
+  }
 
   revalidatePath("/productions");
   return { success: true, documentId: created?.id };

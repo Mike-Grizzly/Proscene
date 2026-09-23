@@ -63,6 +63,12 @@ export const documents = pgTable("documents", {
   sourcePageEnd: integer("source_page_end"),
   // PDF page count, recorded by the AI parse / split. Null until known.
   pageCount: integer("page_count"),
+  // Automatic "readable copy" of a scan the in-app viewer (pdf.js) can't draw
+  // (1-bit CCITT/JBIG2 ImageMask scans render blank). null = not assessed;
+  // "pending" = being rendered server-side; "done" = a readable copy exists
+  // (this row is the original, kept non-default); "skipped" = renders fine or
+  // not a script/scan; "failed" = the manual "Make searchable" remains.
+  renderStatus: text("render_status"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

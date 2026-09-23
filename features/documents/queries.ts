@@ -33,6 +33,7 @@ export async function getDocumentsByProduction(productionId: string) {
       processingStatus: documents.processingStatus,
       scriptKind: documents.scriptKind,
       sourceDocumentId: documents.sourceDocumentId,
+      renderStatus: documents.renderStatus,
       createdAt: documents.createdAt,
       uploadedByFirstName: profiles.firstName,
       uploadedByLastName: profiles.lastName,

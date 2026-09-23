@@ -39,6 +39,7 @@ import {
 } from "./constants";
 import { hasPendingChunks, validateSplitRanges, pagesInRange, aiBookmarksFromResult } from "./parse-utils";
 import { seedSharedBookmarks } from "./bookmarks";
+import { scheduleReadableCopy } from "./readable";
 import { loadPdf, extractPageRange, buildImagePdf } from "./pdf-split";
 import { openWithPdfium } from "./pdf-raster";
 
@@ -1288,6 +1289,11 @@ export async function splitScriptDocument(
     return { librettoDocumentId: lib.id, vocalScoreDocumentId: score.id };
   });
 
+  // Both halves inherit the original's scan encoding, so each gets a readable
+  // copy in the background when the viewer can't draw it.
+  await scheduleReadableCopy(ids.librettoDocumentId);
+  await scheduleReadableCopy(ids.vocalScoreDocumentId);
+
   // Stage the libretto's analysis straight away (the split itself spent no
   // quota). If the caps block it, hand back the reason instead of failing.
   const quotaError = await checkParseQuota(user, productionId);
@@ -1510,6 +1516,10 @@ export async function attachWizardScript(input: {
     .set({ productionId: prod.id, documentId: doc.id, storagePath: null })
     .where(eq(scriptParses.id, input.parseId));
 
+  // A scan the viewer can't draw gets a readable copy; the parse row is
+  // re-pointed at it once installed (same pages, so the chunk plan holds).
+  await scheduleReadableCopy(doc.id);
+
   revalidatePath("/productions");
   return { success: true };
 }
@@ -1570,18 +1580,23 @@ export async function attachWizardScriptByPath(input: {
   if (moveError) return { error: "Could not attach the script file." };
 
   const title = input.fileName.replace(/\.[^.]+$/, "") || "Script";
-  await db.insert(documents).values({
-    productionId: prod.id,
-    uploadedBy: user.id,
-    title,
-    fileName: input.fileName,
-    fileSize: input.fileSize,
-    contentType: "application/pdf",
-    storagePath: newPath,
-    documentType: "script",
-    isDefaultScript: true,
-    processingStatus: "ready",
-  });
+  const [doc] = await db
+    .insert(documents)
+    .values({
+      productionId: prod.id,
+      uploadedBy: user.id,
+      title,
+      fileName: input.fileName,
+      fileSize: input.fileSize,
+      contentType: "application/pdf",
+      storagePath: newPath,
+      documentType: "script",
+      isDefaultScript: true,
+      processingStatus: "ready",
+    })
+    .returning({ id: documents.id });
+
+  if (doc) await scheduleReadableCopy(doc.id);
 
   revalidatePath("/productions");
   return { success: true };

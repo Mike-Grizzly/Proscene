@@ -10,6 +10,11 @@ As a stage manager, I can upload scripts, schedules, and other production files 
 - **Document annotations/comments:** Placeholder sidebar exists in the viewer but no data model or functionality. Scaffolded only.
 - **AI script analysis:** Schema fields exist (`documentType`, `processingStatus`) but no processing logic. Scaffolded only.
 
+> **Readable copies (2026-09-23):** a script PDF that is a 1-bit scan gets an
+> image-only "(readable)" copy made automatically after upload, which
+> becomes the default script; the original stays badged "Original scan"
+> (`render_status`). See `19-ai-script-analysis.md` → "Readable copies".
+
 > **Folders + privacy:** documents are organized into `document_folders`
 > (added after this spec). Folders can be role-restricted — see
 > `13-document-folder-privacy.md`.

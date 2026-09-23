@@ -21,8 +21,9 @@ export type RasterPage = { page: number; png: Buffer; width: number; height: num
 
 export type RasterDoc = {
   pageCount: number;
-  /** Render one 1-based page to a PNG. Gray by default (scans are gray). */
-  renderPage(page: number, opts?: { scale?: number; gray?: boolean }): Promise<RasterPage>;
+  /** Render one 1-based page to a PNG. Gray by default (scans are gray);
+   *  `oneBit` packs a bilevel PNG for black-and-white scans. */
+  renderPage(page: number, opts?: { scale?: number; gray?: boolean; oneBit?: boolean }): Promise<RasterPage>;
   destroy(): void;
 };
 
@@ -61,7 +62,7 @@ export async function openWithPdfium(bytes: Uint8Array): Promise<RasterDoc> {
       });
       return {
         page,
-        png: encodePng(r.data, r.width, r.height, gray ? 1 : 4),
+        png: encodePng(r.data, r.width, r.height, gray ? 1 : 4, { oneBit: gray && !!opts.oneBit }),
         width: r.width,
         height: r.height,
         pointsWidth: r.originalWidth,

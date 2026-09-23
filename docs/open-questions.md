@@ -55,6 +55,16 @@ Built on `claude/loving-babbage-ggkydb` (spec: `feature-specs/19-ai-script-analy
 - **Alternating-section books** (libretto / score per act) can't be split
   cleanly in v1 — one contiguous range per half; the rest stays in the original.
   Revisit if it shows up in practice (would need multiple ranges per document).
+- **Round 4 (2026-09-23) — verify:** upload the original 282-page scan through
+  the wizard → `documents.render_status` goes `pending → done` within about a
+  minute, a "(readable)" copy appears as the default, the Script tab opens it
+  in the in-app editor (no native viewer), the parse row now points at the
+  copy and completes on it, and apply seeds bookmarks on the copy. A JPEG
+  scan and a text PDF must get `skipped` and behave exactly as before. If the
+  copy never appears, check the function logs for `installReadableCopy` and
+  the row's `render_status` (`failed` = viewer falls back to the old
+  behaviour). The `after()` work needs the page's `maxDuration` (300 s) —
+  a Vercel plan with a lower ceiling would cut a very long book short.
 - **Round 3 (2026-09-23) — verify:** re-analyse the "(searchable)" libretto →
   `ready` (text mode, one chunk, no JSON error); on the original scan libretto,
   "Make searchable" → the new document opens with the AI bookmarks already
