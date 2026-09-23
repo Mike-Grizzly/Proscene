@@ -12,6 +12,7 @@ import { getScriptUrl, ensureMemberBookmarks } from "@/features/scripts/actions"
 import type { Annotation, Bookmark, PageOverrides } from "@/features/scripts/constants";
 import { ScriptScreen } from "./script-screen";
 import { EmptyState } from "@/components/ui/empty-state";
+import { PreparingReadable } from "./preparing-readable";
 
 export default async function ScriptPage({
   params,
@@ -47,6 +48,12 @@ export default async function ScriptPage({
         />
       </div>
     );
+  }
+
+  // A readable copy of this scan is being rendered server-side; it takes
+  // over as the active script once installed.
+  if (script.renderStatus === "pending") {
+    return <PreparingReadable title={script.title} />;
   }
 
   const [annotationRow, pdfUrl] = await Promise.all([

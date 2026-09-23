@@ -14,6 +14,10 @@ import { getPinnedItemIds } from "@/features/pins/queries";
 import { canViewFolder } from "@/features/documents/constants";
 import { DocumentsClient } from "./documents-client";
 
+// Script uploads finalise here and may render a readable copy of a scan in
+// the background (about a minute for a full book).
+export const maxDuration = 300;
+
 export default async function DocumentsPage({
   params,
   searchParams,

@@ -3095,3 +3095,32 @@ bookmarks are per document.
    rebuild also inherits `script_kind`, `page_count` and provenance.
 3. Bookmark seeding lives in a plain server module (`bookmarks.ts`) shared by
    apply and rebuild; the pure id/shape helper lives in `parse-utils.ts`.
+
+---
+
+## 2026-09-23 — Unrenderable scans get a readable copy automatically; the copy replaces the original as the script, the original is kept
+
+**Context:** the owner's book is a 1-bit CCITT scan that pdf.js draws blank,
+so the Script tool fell back to the native viewer. The manual "Make
+searchable" rebuild fixed one file at a time, in the browser, and only from
+two of the five upload paths.
+
+**Decisions:**
+1. **Automatic, server-side, at every entry point.** Detection is cheap
+   (image XObject bit depth) and the render is fast (pdfium → 1-bit PNG →
+   pdf-lib, ~36 s for 282 pages), so it runs in `after()` from every path
+   that creates a script document, including both split halves.
+2. **Auto-replace, keep the original** (owner's choice over "offer a button"
+   or "replace and discard"). The copy takes over as the default script and
+   inherits preferences, the parse row and annotations, so nobody has to
+   act; the original stays in Documents (non-default, "Original scan") for
+   download and as the source of truth.
+3. **Only 1-bit scans qualify.** JPEG/8-bit scans render fine in pdf.js and a
+   re-render would only cost storage; text PDFs are never touched.
+4. **"Make searchable" stays** as the manual fallback and as the way to get a
+   text layer; the readable copy is image-only on purpose (no OCR cost, no
+   blocking).
+
+**Impact:** `documents.render_status` column (migration
+`document_render_status`, applied live); `pdfium.wasm` traced into two more
+pages; not live-verified — see open-questions.

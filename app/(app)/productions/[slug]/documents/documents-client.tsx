@@ -465,6 +465,28 @@ export function DocumentsClient({
                             {SCRIPT_KIND_LABELS[doc.scriptKind]}
                           </span>
                         )}
+                        {(doc.renderStatus === "done" || doc.renderStatus === "pending") && (
+                          <span
+                            title={
+                              doc.renderStatus === "done"
+                                ? "The viewer can't draw this scan directly; a readable copy was made from it."
+                                : "A readable copy of this scan is being made in the background."
+                            }
+                            style={{
+                              flexShrink: 0,
+                              fontSize: 10,
+                              fontWeight: 600,
+                              letterSpacing: ".04em",
+                              textTransform: "uppercase",
+                              padding: "2px 6px",
+                              borderRadius: 999,
+                              background: "var(--bg-muted)",
+                              color: "var(--ink-3)",
+                            }}
+                          >
+                            {doc.renderStatus === "done" ? "Original scan" : "Preparing readable copy…"}
+                          </span>
+                        )}
                       </div>
                       <div
                         style={{

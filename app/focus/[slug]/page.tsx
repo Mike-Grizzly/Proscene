@@ -47,6 +47,7 @@ import { AiReviewClient } from "@/app/(app)/productions/[slug]/script/ai/ai-revi
 import { FocusShell } from "./focus-shell";
 import { FocusScriptHost } from "./focus-script-host";
 import { FocusScriptUpload } from "./focus-script-upload";
+import { PreparingReadable } from "@/app/(app)/productions/[slug]/script/preparing-readable";
 import { FocusDocUpload } from "./focus-doc-upload";
 import { getDesignerSeat } from "@/features/designer/entitlement";
 import type { DesignerTool } from "@/features/designer/constants";
@@ -311,6 +312,14 @@ export default async function FocusPage({
             </a>
           </div>
         )}
+      </FocusShell>
+    );
+  }
+
+  if (script.renderStatus === "pending") {
+    return (
+      <FocusShell {...shellProps} mode="script">
+        <PreparingReadable title={script.title} />
       </FocusShell>
     );
   }

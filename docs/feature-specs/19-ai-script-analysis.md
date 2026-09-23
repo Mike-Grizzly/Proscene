@@ -382,6 +382,49 @@ unescaped into JSON strings.
   every member (`features/scripts/bookmarks.ts`), so the rebuilt script opens
   bookmarked. Members who had picked the scan follow it to the rebuild.
 
+### Readable copies of unrenderable scans, made automatically at upload (2026-09-23)
+
+The owner's scan is a 1-bit CCITT ImageMask PDF that pdf.js (the in-app
+viewer's engine) draws blank, so the Script tool fell back to the native PDF
+viewer and every tool was useless; the only remedy was the manual, in-browser
+"Make searchable" rebuild (minutes, tab must stay open, ~26 MB per 130 pages),
+which is not offered on the wizard, the Focus upload, or the split halves.
+Measured server-side on the real book: pdfium renders a page to a 1-bit PNG at
+scale 3 (~216 dpi) in ~126 ms at ~23 KB — 282 pages ≈ 16 MB in ~36 s.
+
+- **Detection** (`readable-detect.ts`, pure): a script PDF is a candidate when
+  it is a scan (text < 200 chars) **and** its image XObjects are 1-bit
+  (`/BitsPerComponent 1`, `/ImageMask true`, `CCITTFaxDecode`/`JBIG2Decode`),
+  enumerated with pdf-lib or, if it can't open the file, a raw-bytes scan.
+  JPEG / 8-bit scans and text PDFs are left alone (`render_status = skipped`).
+- **Render + install** (`readable.ts`, server-only): pdfium → grayscale bitmap
+  → **1-bit PNG** (`encodePng` `oneBit` mode; threshold 128) → `buildImagePdf`
+  (page size = original points); mixed books use 8-bit gray at scale 2. The
+  copy is uploaded next to the original (`…-readable.pdf`) and inserted as a
+  new `documents` row titled "… (readable)" with `script_kind`, `page_count`
+  and provenance copied. **It takes over as the default when the original
+  was**, and `script_preferences.active_script_id`, `script_parses.document_id`
+  (any status — same pages, so an in-flight chunk plan still holds) and
+  `script_annotations.script_id` are re-pointed to it. The original stays in
+  Documents, non-default, badged "Original scan" (`render_status = done`).
+  Failures set `render_status = failed` and the viewer behaves exactly as
+  before (native viewer + "Make searchable").
+- **Scheduling:** `scheduleReadableCopy(documentId)` sets `render_status =
+  pending` and runs the install in `after()` from `finalizeDocumentUpload`
+  (Documents tab + Focus upload; script PDFs only), `attachWizardScript` /
+  `attachWizardScriptByPath` (wizard) and `splitScriptDocument` (both halves).
+  The Documents page and `/productions/new` export `maxDuration = 300` and
+  have `pdfium.wasm` traced in, like the AI page and Focus already did.
+- **Viewer:** while the active script's `render_status` is `pending`, the
+  Script tab and Focus show "Preparing a readable copy of this scan…" and
+  refresh every 5 s; the copy is picked up automatically once installed.
+- **Not changed:** "Make searchable" stays as the manual fallback (and adds a
+  text layer, which the readable copy does not have); the in-viewer OCR text
+  tools now work on the copy because its pages actually render.
+
+**Schema:** `documents.render_status text` (`null | pending | done | skipped |
+failed`) — migration `document_render_status` applied live via Supabase MCP.
+
 ### Limitations (v1)
 - One contiguous range per half: a book that alternates libretto / score per
   act can't be split cleanly — the proposal covers the largest run of each; the

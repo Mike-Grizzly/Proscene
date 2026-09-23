@@ -24,6 +24,18 @@ describe("encodePng", () => {
     const img = await doc.embedPng(png);
     expect([img.width, img.height]).toEqual([w, h]);
   });
+  it("produces a 1-bit PNG (bit depth 1) that pdf-lib can embed", async () => {
+    const w = 20, h = 3;
+    const gray = new Uint8Array(w * h).map((_, i) => (i % 3 ? 255 : 0));
+    const png = encodePng(gray, w, h, 1, { oneBit: true });
+    expect(png[24]).toBe(1); // IHDR bit depth
+    expect(png[25]).toBe(0); // grayscale
+    const doc = await PDFDocument.create();
+    const img = await doc.embedPng(png);
+    expect([img.width, img.height]).toEqual([w, h]);
+    // markedly smaller than the 8-bit encoding of the same bitmap
+    expect(png.length).toBeLessThan(encodePng(gray, w, h, 1).length);
+  });
   it("rejects undersized bitmaps", () => {
     expect(() => encodePng(new Uint8Array(3), 2, 2, 1)).toThrow();
   });

@@ -23,6 +23,7 @@ const scriptSelect = {
   processingStatus: documents.processingStatus,
   scriptKind: documents.scriptKind,
   pageCount: documents.pageCount,
+  renderStatus: documents.renderStatus,
   uploadedByFirstName: profiles.firstName,
   uploadedByLastName: profiles.lastName,
 };
@@ -93,6 +94,7 @@ export async function getScriptDocuments(productionId: string) {
       processingStatus: documents.processingStatus,
       sourceDocumentId: documents.sourceDocumentId,
       scriptVersion: documents.scriptVersion,
+      renderStatus: documents.renderStatus,
       createdAt: documents.createdAt,
     })
     .from(documents)
