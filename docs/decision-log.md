@@ -3095,3 +3095,14 @@ bookmarks are per document.
    rebuild also inherits `script_kind`, `page_count` and provenance.
 3. Bookmark seeding lives in a plain server module (`bookmarks.ts`) shared by
    apply and rebuild; the pure id/shape helper lives in `parse-utils.ts`.
+
+---
+
+## 2026-09-29 — Pipe cues snap conservatively; cue descriptions wrap to a fixed column
+
+**Decision:** A pipe cue takes its vertical band from a text-layer span only when that span is genuinely the line under the pointer (band contains the click, or a near miss within 0.4 line heights); otherwise it is a typical-height pipe centred on the click. Span heights are clamped to 0.6–1.6× the page's median line height. The click's x is never adjusted. Cue descriptions wrap at a fixed width (170 base px, scaled with zoom and the per-cue description scale) and honour explicit line breaks; the width is a constant, not a per-cue setting.
+
+**Reason:** Nearest-span snapping was pulling pipes onto neighbouring lines and inheriting odd span heights, which read as the tool "snapping to letters". A fixed wrap column keeps long calls boxed horizontally and running down the page, matching how prompt books are marked, without adding another control to the cue editor.
+
+**Impact:** Existing cues are unchanged (stored rects are not rewritten). Box and pipe markers are now draggable; moving one re-captures the cue sheet's "Line" text at the new spot. Anything that renders a cue label (SVG overlay, label stacking, Focus gutter card, PDF export) must go through `cueDescLines` so line breaks agree everywhere.
+
