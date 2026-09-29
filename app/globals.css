@@ -1372,6 +1372,13 @@ textarea.field {
   border-color: var(--accent);
   background: var(--bg);
 }
+.sv-cuesheet-note {
+  display: block;
+  resize: none;
+  line-height: 1.35;
+  min-height: 0;
+  white-space: pre-wrap;
+}
 .sv-cuesheet-page {
   border: none;
   background: none;
