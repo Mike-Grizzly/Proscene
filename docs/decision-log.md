@@ -3100,7 +3100,7 @@ bookmarks are per document.
 
 ## 2026-09-29 — Pipe cues snap conservatively; cue descriptions wrap to a fixed column
 
-**Decision:** A pipe cue takes its vertical band from a text-layer span only when that span is genuinely the line under the pointer (band contains the click, or a near miss within 0.4 line heights); otherwise it is a typical-height pipe centred on the click. Span heights are clamped to 0.6–1.6× the page's median line height. The click's x is never adjusted. Cue descriptions wrap at a fixed width (170 base px, scaled with zoom and the per-cue description scale) and honour explicit line breaks; the width is a constant, not a per-cue setting.
+**Decision:** A pipe cue takes its vertical band from a text-layer span only when that span is genuinely the line under the pointer (band contains the click, or a near miss within 0.4 line heights); otherwise it is a typical-height pipe centred on the click. Span heights are clamped to 0.6–1.6× the page's median line height. The click's x is never adjusted. Cue descriptions — and, after the owner's live check, cue numbers too — wrap at a fixed width (170 base px, scaled with zoom and the per-cue text scale) and honour explicit line breaks; the width is a constant, not a per-cue setting. Extra number lines hang below the first and push the description down, so the leader always meets the first line.
 
 **Reason:** Nearest-span snapping was pulling pipes onto neighbouring lines and inheriting odd span heights, which read as the tool "snapping to letters". A fixed wrap column keeps long calls boxed horizontally and running down the page, matching how prompt books are marked, without adding another control to the cue editor.
 

@@ -2415,7 +2415,7 @@ export function ScriptViewer({
                 )}
                 {ann.type === "cue" && (
                   <span style={{ fontSize: 12, color: "var(--ink-2)" }}>
-                    {ann.cueNumber}
+                    {ann.cueNumber.replace(/\s*\n+\s*/g, " / ")}
                     {ann.cueDescription
                       ? ` — ${ann.cueDescription.replace(/\s*\n+\s*/g, " / ")}`
                       : ""}
@@ -2529,13 +2529,18 @@ export function ScriptViewer({
                   >
                     Cue number
                   </label>
-                  <input
+                  <textarea
                     autoFocus
                     value={pendingCueNumber}
                     onChange={(e) => setPendingCueNumber(e.target.value)}
                     onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        confirmPending();
+                      }
                       if (e.key === "Escape") setPendingAnnotation(null);
                     }}
+                    rows={1}
                     placeholder="e.g. 12.5"
                     style={{
                       width: "100%",
@@ -2548,6 +2553,8 @@ export function ScriptViewer({
                       outline: "none",
                       marginBottom: 8,
                       fontFamily: "inherit",
+                      resize: "none",
+                      lineHeight: 1.35,
                     }}
                   />
                   <label
@@ -2587,7 +2594,7 @@ export function ScriptViewer({
                     }}
                   />
                   <div style={{ fontSize: 10.5, color: "var(--ink-4)", marginTop: 3 }}>
-                    Long descriptions wrap on the page. Shift+Enter starts a new line.
+                    Long labels wrap on the page. Shift+Enter starts a new line (in either field).
                   </div>
                 </>
               )}
@@ -2992,6 +2999,25 @@ function cueDescFont(scale: number, descScale: number): string {
   return `${9 * scale * descScale}px system-ui, sans-serif`;
 }
 
+// The cue number (label) breaks lines the same way — explicit newlines plus
+// wrapping to the same column — and its extra lines hang below the first,
+// pushing the description down.
+const CUE_NUM_LINE_H = 15; // number line height, base px (× cueScale × numScale)
+
+function cueNumFont(scale: number, numScale: number): string {
+  return `bold ${13 * scale * numScale}px system-ui, sans-serif`;
+}
+
+/** The cue number's rendered lines (wrapped + explicit breaks). */
+function cueNumLines(cueNumber: string, scale: number, numScale: number): string[] {
+  if (!cueNumber.trim()) return [];
+  return wrapLabelText(
+    cueNumber.trim(),
+    cueNumFont(scale, numScale),
+    CUE_DESC_WRAP_W * scale * numScale,
+  );
+}
+
 /** The description's rendered lines (wrapped + explicit breaks); [] if none. */
 function cueDescLines(description: string, scale: number, descScale: number): string[] {
   if (!description.trim()) return [];
@@ -3012,6 +3038,7 @@ function stackCueLabels(
     labelPos?: { x: number; y: number };
     cueTextScale?: number;
     cueDescScale?: number;
+    cueNumScale?: number;
   }[],
   canvasH: number,
   scale = 1,
@@ -3034,17 +3061,23 @@ function stackCueLabels(
       // don't take part in auto-stacking.
       .filter((c) => c.leaderSide === side && !c.labelPos)
       .map((c) => {
+        const numScale = c.cueNumScale ?? c.cueTextScale ?? 1;
         const descScale = c.cueDescScale ?? c.cueTextScale ?? 1;
+        const numLines = cueNumLines(c.cueNumber, scale, numScale).length;
         const lines = cueDescLines(c.cueDescription, scale, descScale).length;
+        // Extra number lines hang below the first one.
+        const numExtra = Math.max(0, numLines - 1) * CUE_NUM_LINE_H * scale * numScale;
         return {
           id: c.id,
           y: (c.rect.y + c.rect.height) * canvasH,
-          // How far the label extends below its number: the description's
-          // first line, plus one line height per extra wrapped line.
+          // How far the label extends below its first number line: the extra
+          // number lines, then the description's first line, plus one line
+          // height per extra wrapped description line.
           descDown:
-            lines > 0
+            numExtra +
+            (lines > 0
               ? DESC_DOWN + (lines - 1) * CUE_DESC_LINE_H * scale * descScale
-              : 0,
+              : 0),
           cueNumber: c.cueNumber,
         };
       })
@@ -3304,18 +3337,23 @@ function CueSheetRow({
         <span className="sv-cuesheet-cue">
           <span className="sv-cuesheet-dot" style={{ background: cc }} />
           {readOnly ? (
-            <span>{cue.cueNumber}</span>
+            <span style={{ whiteSpace: "pre-wrap" }}>{cue.cueNumber}</span>
           ) : (
-            <input
-              className="sv-cuesheet-input"
+            <textarea
+              className="sv-cuesheet-input sv-cuesheet-note"
               defaultValue={cue.cueNumber}
+              rows={Math.max(1, Math.min(4, cue.cueNumber.split("\n").length))}
+              title="Enter saves · Shift+Enter starts a new line"
               onBlur={(e) => {
                 const v = e.target.value.trim();
                 if (v && v !== cue.cueNumber)
                   onEdit(cue.id, { cueNumber: v } as Partial<Annotation>);
               }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  (e.target as HTMLTextAreaElement).blur();
+                }
               }}
             />
           )}
@@ -3541,8 +3579,13 @@ function drawAnnotationOnCanvas(
     const descScale = ann.cueDescScale ?? ann.cueTextScale ?? 1;
     ctx.fillStyle = cc;
     ctx.textAlign = isLeft ? "left" : "right";
-    ctx.font = `bold ${13 * s * numScale}px system-ui, sans-serif`;
-    ctx.fillText(ann.cueNumber, isLeft ? labelX + 6 * s : labelX - 6 * s, labelY - 4 * s);
+    ctx.font = cueNumFont(s, numScale);
+    const numLines = cueNumLines(ann.cueNumber, s, numScale);
+    const numLH = CUE_NUM_LINE_H * s * numScale;
+    numLines.forEach((ln, i) => {
+      ctx.fillText(ln, isLeft ? labelX + 6 * s : labelX - 6 * s, labelY - 4 * s + i * numLH);
+    });
+    const numExtra = Math.max(0, numLines.length - 1) * numLH;
     const descLines = cueDescLines(ann.cueDescription, s, descScale);
     if (descLines.length) {
       ctx.font = cueDescFont(s, descScale);
@@ -3551,7 +3594,7 @@ function drawAnnotationOnCanvas(
         ctx.fillText(
           ln,
           isLeft ? labelX + 6 * s : labelX - 6 * s,
-          labelY + 12 * s * descScale + i * lh,
+          labelY + numExtra + 12 * s * descScale + i * lh,
         );
       });
     }
@@ -3741,6 +3784,12 @@ function AnnotationShape({
     const descLines = cueDescLines(annotation.cueDescription, s, descScale);
     const descLH = CUE_DESC_LINE_H * s * descScale;
     const descExtra = Math.max(0, descLines.length - 1) * descLH;
+    // Same for the cue number: extra lines hang below the first and push the
+    // description down.
+    const numLines = cueNumLines(annotation.cueNumber, s, numScale);
+    const numLH = CUE_NUM_LINE_H * s * numScale;
+    const numExtra = Math.max(0, numLines.length - 1) * numLH;
+    const labelExtra = numExtra + descExtra;
     const markerDraggable = !!onMarkerPointerDown;
     // Gutter card geometry (margin mode only): a neutral, readable card whose
     // width fits the longer of the cue number / description rather than filling
@@ -3748,7 +3797,11 @@ function AnnotationShape({
     const ACCENT_W = 3 * s;
     const padL = 9 * s;
     const padR = 11 * s;
-    const numTextW = (annotation.cueNumber?.length ?? 0) * 8.2 * s * numScale;
+    const numFont = cueNumFont(s, numScale);
+    const numTextW = numLines.reduce(
+      (w, ln) => Math.max(w, measureLabelText(ln, numFont)),
+      0,
+    );
     const descFont = cueDescFont(s, descScale);
     const descTextW = descLines.reduce(
       (w, ln) => Math.max(w, measureLabelText(ln, descFont)),
@@ -3764,7 +3817,7 @@ function AnnotationShape({
     // The card is centred on the leader for a one-line description and grows
     // downward for every extra line.
     const cardBaseH = (descLines.length ? 30 : 21) * s * ts;
-    const cardH = cardBaseH + descExtra;
+    const cardH = cardBaseH + labelExtra;
     const cardY = labelY - cardBaseH / 2;
     const textX = cardX + ACCENT_W + padL;
     // The vertical jog happens off the page, on a single shared rail just before
@@ -3888,12 +3941,16 @@ function AnnotationShape({
                 fontWeight="700"
                 fontFamily="system-ui, sans-serif"
               >
-                {annotation.cueNumber}
+                {numLines.map((ln, i) => (
+                  <tspan key={i} x={textX} dy={i === 0 ? 0 : numLH}>
+                    {ln || "\u00A0"}
+                  </tspan>
+                ))}
               </text>
               {descLines.length > 0 && (
                 <text
                   x={textX}
-                  y={labelY + 10 * s * descScale}
+                  y={labelY + numExtra + 10 * s * descScale}
                   textAnchor="start"
                   fontSize={9 * s * descScale}
                   fill="#52525b"
@@ -3915,7 +3972,7 @@ function AnnotationShape({
                   x={isLeft ? labelX - 4 * s : labelX - 44 * s}
                   y={labelY - 16 * s}
                   width={48 * s}
-                  height={(descLines.length ? 32 * s : 22 * s) + descExtra}
+                  height={(descLines.length ? 32 * s : 22 * s) + labelExtra}
                   fill="transparent"
                 />
               )}
@@ -3929,12 +3986,20 @@ function AnnotationShape({
                 fontWeight="700"
                 fontFamily="system-ui, sans-serif"
               >
-                {annotation.cueNumber}
+                {numLines.map((ln, i) => (
+                  <tspan
+                    key={i}
+                    x={isLeft ? labelX + 6 * s : labelX - 6 * s}
+                    dy={i === 0 ? 0 : numLH}
+                  >
+                    {ln || "\u00A0"}
+                  </tspan>
+                ))}
               </text>
               {descLines.length > 0 && (
                 <text
                   x={isLeft ? labelX + 6 * s : labelX - 6 * s}
-                  y={labelY + 12 * s * descScale}
+                  y={labelY + numExtra + 12 * s * descScale}
                   textAnchor={textAnchor}
                   fontSize={9 * s * descScale}
                   fill={cc}
@@ -4496,13 +4561,20 @@ function PanelAnnotationItem({
         {annotation.type === "cue" && (
           editing ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }} onClick={(e) => e.stopPropagation()}>
-              <input
+              <textarea
                 autoFocus
                 value={draftCueNum}
                 onChange={(e) => setDraftCueNum(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Escape") setEditing(false); }}
-                placeholder="Cue number"
-                style={inputStyle}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    confirmEdit();
+                  }
+                  if (e.key === "Escape") setEditing(false);
+                }}
+                rows={1}
+                placeholder="Cue number (Shift+Enter for a new line)"
+                style={{ ...inputStyle, resize: "none", lineHeight: 1.35 }}
               />
               <textarea
                 value={draftCueDesc}
@@ -4591,7 +4663,7 @@ function PanelAnnotationItem({
             </div>
           ) : (
             <>
-              <div style={{ fontSize: 12, fontWeight: 700, color: accentColor }}>{annotation.cueNumber}</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: accentColor, whiteSpace: "pre-wrap" }}>{annotation.cueNumber}</div>
               {annotation.cueDescription && (
                 <div style={{ fontSize: 12, color: "var(--ink-2)", marginTop: 1, whiteSpace: "pre-wrap", lineHeight: 1.35, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical" }}>
                   {annotation.cueDescription}
